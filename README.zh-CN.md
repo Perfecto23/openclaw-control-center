@@ -1,6 +1,6 @@
 # OpenClaw Control Center
 
-<img src="docs/assets/openclaw-control-center-icon.svg" alt="OpenClaw Control Center 图标" width="112" />
+<img src="docs/assets/overview-hero-zh.png" alt="OpenClaw Control Center 总览横幅截图" width="1200" />
 
 OpenClaw 的安全优先、本地优先控制中心。
 
@@ -28,8 +28,6 @@ OpenClaw 的安全优先、本地优先控制中心。
 
 ## 截图
 以下截图来自一个本地 OpenClaw 环境：
-
-<img src="docs/assets/overview-en.png" alt="OpenClaw Control Center 总览截图" width="900" />
 
 <img src="docs/assets/usage-en.png" alt="OpenClaw Control Center 用量截图" width="900" />
 

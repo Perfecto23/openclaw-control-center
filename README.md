@@ -1,6 +1,6 @@
 # OpenClaw Control Center
 
-<img src="docs/assets/openclaw-control-center-icon.svg" alt="OpenClaw Control Center icon" width="112" />
+<img src="docs/assets/overview-hero-en.png" alt="OpenClaw Control Center overview hero screenshot" width="1200" />
 
 Safety-first local control center for OpenClaw.
 
@@ -28,8 +28,6 @@ Language: **English** | [中文](README.zh-CN.md)
 
 ## Screenshots
 Example UI from a local OpenClaw environment:
-
-<img src="docs/assets/overview-en.png" alt="OpenClaw Control Center overview screenshot" width="900" />
 
 <img src="docs/assets/usage-en.png" alt="OpenClaw Control Center usage screenshot" width="900" />
 

@@ -1,5 +1,25 @@
 # Progress
 
+## Phase 131 (README hero switched from icon block to wide overview screenshot) — Completed
+- Scope:
+  - Replace the weak-looking small icon block at the top of the public README with a product-led hero that immediately shows the real UI.
+  - Use a wide landscape crop so the GitHub landing page feels intentional instead of vertically awkward.
+- Changed files:
+  - `README.md`
+  - `README.zh-CN.md`
+  - `docs/assets/overview-hero-en.png`
+  - `docs/assets/overview-hero-zh.png`
+  - `docs/PROGRESS.md`
+- Implementation:
+  - Captured new wide overview hero screenshots for both English and Chinese.
+  - Replaced the small icon block at the top of each README with the appropriate overview hero screenshot.
+  - Removed the duplicated overview image from the lower screenshot section and kept the secondary usage screenshot there.
+- Verification:
+  - `npm run release:audit` passed.
+  - `npm run build` passed.
+  - `npm test` passed.
+  - `npm run smoke:ui` passed.
+
 ## Phase 130 (README language switch becomes real file-level localization) — Completed
 - Scope:
   - Replace the fake in-page README language jump with a real English/Chinese file split for GitHub readers.
