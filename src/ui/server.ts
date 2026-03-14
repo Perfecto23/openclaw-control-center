@@ -3959,7 +3959,7 @@ async function loadCachedSessionPreview(snapshot: ReadModelSnapshot, toolClient:
     filters: {},
     page: 1,
     pageSize: 12,
-    historyLimit: 10,
+    historyLimit: 5,
   });
   renderSessionPreviewCache = {
     snapshotAt: snapshot.generatedAt,
@@ -3970,22 +3970,19 @@ async function loadCachedSessionPreview(snapshot: ReadModelSnapshot, toolClient:
 }
 
 function buildUsageCostCacheKey(snapshot: ReadModelSnapshot, mode: UsageCostMode): string {
-  const sessionStamp = snapshot.sessions
-    .map((item) => [item.sessionKey, item.agentId ?? "", item.state, item.lastMessageAt ?? "", item.label ?? ""].join(":"))
-    .join("|");
-  const statusStamp = snapshot.statuses
-    .map((item) =>
-      [
-        item.sessionKey,
-        item.model ?? "",
-        String(item.tokensIn ?? 0),
-        String(item.tokensOut ?? 0),
-        String(item.cost ?? 0),
-        item.updatedAt ?? "",
-      ].join(":"),
-    )
-    .join("|");
-  return `${mode}|${sessionStamp}|${statusStamp}`;
+  // Content-based fingerprint – changes only when session/status data
+  // actually changes, unlike generatedAt which changes every poll cycle.
+  // Session state (running→idle etc.) affects the output (contextWindows
+  // rows use session.state), so we include it alongside status timestamps.
+  const sessionFingerprint = snapshot.sessions
+    .map((s) => `${s.sessionKey}:${s.state}`)
+    .sort()
+    .join(";");
+  const statusFingerprint = snapshot.statuses
+    .map((s) => `${s.sessionKey}:${s.updatedAt}`)
+    .sort()
+    .join(";");
+  return `${mode}|${sessionFingerprint}|${statusFingerprint}`;
 }
 
 async function loadCachedUsageCost(
@@ -8084,7 +8081,7 @@ function parseSessionQuery(searchParams: URLSearchParams, strict: boolean): Sess
   return {
     filters,
     page: readPositiveIntQuery(searchParams.get("page"), "page", 1, strict),
-    pageSize: readPositiveIntQuery(searchParams.get("pageSize"), "pageSize", 20, strict, 100),
+    pageSize: readPositiveIntQuery(searchParams.get("pageSize"), "pageSize", 12, strict, 100),
     historyLimit: readPositiveIntQuery(searchParams.get("historyLimit"), "historyLimit", 8, strict, 200),
   };
 }
