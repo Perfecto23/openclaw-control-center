@@ -127,10 +127,7 @@ function buildCommanderDigest(snapshot: ReadModelSnapshot, alerts: CommanderAler
     usage,
     approvals: {
       total: snapshot.approvals.length,
-      pending: snapshot.approvals.filter((item) => item.status === "pending").length,
-      approved: snapshot.approvals.filter((item) => item.status === "approved").length,
-      denied: snapshot.approvals.filter((item) => item.status === "denied").length,
-      unknown: snapshot.approvals.filter((item) => item.status === "unknown").length,
+      ...countApprovalsByStatus(snapshot.approvals),
     },
     projects: {
       total: snapshot.projects.projects.length,
@@ -241,4 +238,15 @@ function countBy(values: string[]): Record<string, number> {
     out[value] = (out[value] ?? 0) + 1;
   }
   return out;
+}
+
+function countApprovalsByStatus(approvals: Array<{ status: string }>): { pending: number; approved: number; denied: number; unknown: number } {
+  const counts = { pending: 0, approved: 0, denied: 0, unknown: 0 };
+  for (const a of approvals) {
+    if (a.status === "pending") counts.pending++;
+    else if (a.status === "approved") counts.approved++;
+    else if (a.status === "denied") counts.denied++;
+    else counts.unknown++;
+  }
+  return counts;
 }

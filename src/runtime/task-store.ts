@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { loadProjectStore } from "./project-store";
 import type {
@@ -15,6 +15,9 @@ import type {
 const RUNTIME_DIR = join(process.cwd(), "runtime");
 export const TASKS_PATH = join(RUNTIME_DIR, "tasks.json");
 const DEFAULT_WARN_RATIO = 0.8;
+const TASK_STORE_CACHE_TTL_MS = 5_000;
+
+let taskStoreCache: { value: TaskStoreSnapshot; expiresAt: number; mtimeMs: number } | undefined;
 const PROJECT_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
 const TASK_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
 
@@ -64,15 +67,28 @@ export interface TaskMutationResult {
 }
 
 export async function loadTaskStore(): Promise<TaskStoreSnapshot> {
+  const now = Date.now();
+  if (taskStoreCache && taskStoreCache.expiresAt > now) {
+    try {
+      const fileStat = await stat(TASKS_PATH);
+      if (fileStat.mtimeMs <= taskStoreCache.mtimeMs) return taskStoreCache.value;
+    } catch {
+      return taskStoreCache.value;
+    }
+  }
   try {
+    const fileStat = await stat(TASKS_PATH);
     const raw = await readFile(TASKS_PATH, "utf8");
-    return normalizeTaskStore(JSON.parse(raw));
+    const value = normalizeTaskStore(JSON.parse(raw));
+    taskStoreCache = { value, expiresAt: now + TASK_STORE_CACHE_TTL_MS, mtimeMs: fileStat.mtimeMs };
+    return value;
   } catch {
     return cloneEmptyStore();
   }
 }
 
 export async function saveTaskStore(next: TaskStoreSnapshot): Promise<string> {
+  taskStoreCache = undefined;
   const normalized = normalizeTaskStore({
     ...next,
     updatedAt: new Date().toISOString(),

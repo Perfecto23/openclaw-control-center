@@ -125,6 +125,17 @@ export function commanderExceptionsFeed(snapshot: ReadModelSnapshot): CommanderE
   const exceptions = commanderExceptions(snapshot);
   const fallbackOccurredAt = snapshot.generatedAt;
 
+  const taskById = new Map(snapshot.tasks.tasks.map((t) => [t.taskId, t]));
+  const projectById = new Map(snapshot.projects.projects.map((p) => [p.projectId, p]));
+  const sessionsByAgent = new Map<string, string[]>();
+  for (const session of snapshot.sessions) {
+    if (!session.agentId) continue;
+    const arr = sessionsByAgent.get(session.agentId) ?? [];
+    arr.push(session.sessionKey);
+    sessionsByAgent.set(session.agentId, arr);
+  }
+  const statusBySessionKey = new Map(snapshot.statuses.map((s) => [s.sessionKey, s]));
+
   if (snapshot.sessions.length === 0) {
     items.push({
       level: "info",
@@ -181,7 +192,7 @@ export function commanderExceptionsFeed(snapshot: ReadModelSnapshot): CommanderE
       sourceId: `${budget.scope}:${budget.scopeId}`,
       message: `${budget.scope} ${budget.label} is over budget.`,
       route: routeForLevel("action-required"),
-      occurredAt: deriveBudgetOccurredAt(snapshot, budget) ?? fallbackOccurredAt,
+      occurredAt: deriveBudgetOccurredAt(budget, taskById, projectById, sessionsByAgent, statusBySessionKey) ?? fallbackOccurredAt,
     });
   }
 
@@ -199,14 +210,17 @@ export function commanderExceptionsFeed(snapshot: ReadModelSnapshot): CommanderE
 
   const sortedItems = [...items].sort(compareFeedItems);
 
+  const feedCounts = { info: 0, warn: 0, actionRequired: 0 };
+  for (const item of sortedItems) {
+    if (item.level === "info") feedCounts.info++;
+    else if (item.level === "warn") feedCounts.warn++;
+    else if (item.level === "action-required") feedCounts.actionRequired++;
+  }
+
   return {
     generatedAt: new Date().toISOString(),
     items: sortedItems,
-    counts: {
-      info: sortedItems.filter((item) => item.level === "info").length,
-      warn: sortedItems.filter((item) => item.level === "warn").length,
-      actionRequired: sortedItems.filter((item) => item.level === "action-required").length,
-    },
+    counts: feedCounts,
   };
 }
 
@@ -254,26 +268,24 @@ function isFreshRuntimeIssueSession(lastMessageAt: string | undefined, nowMs: nu
 }
 
 function deriveBudgetOccurredAt(
-  snapshot: ReadModelSnapshot,
   budget: BudgetEvaluation,
+  taskById: Map<string, { taskId: string; updatedAt: string }>,
+  projectById: Map<string, { projectId: string; updatedAt: string }>,
+  sessionsByAgent: Map<string, string[]>,
+  statusBySessionKey: Map<string, { sessionKey: string; updatedAt?: string }>,
 ): string | undefined {
   if (budget.scope === "task") {
-    const task = snapshot.tasks.tasks.find((item) => item.taskId === budget.scopeId);
-    return task?.updatedAt;
+    return taskById.get(budget.scopeId)?.updatedAt;
   }
   if (budget.scope === "project") {
-    const project = snapshot.projects.projects.find((item) => item.projectId === budget.scopeId);
-    return project?.updatedAt;
+    return projectById.get(budget.scopeId)?.updatedAt;
   }
   if (budget.scope === "agent") {
-    const sessionKeys = snapshot.sessions
-      .filter((session) => session.agentId === budget.scopeId)
-      .map((session) => session.sessionKey);
-    const statusTimes = snapshot.statuses
-      .filter((status) => sessionKeys.includes(status.sessionKey))
-      .map((status) => status.updatedAt)
-      .filter((value): value is string => typeof value === "string");
-    return statusTimes.sort((a, b) => toMs(b) - toMs(a))[0];
+    const keys = sessionsByAgent.get(budget.scopeId) ?? [];
+    const times = keys
+      .map((k) => statusBySessionKey.get(k)?.updatedAt)
+      .filter((v): v is string => typeof v === "string");
+    return times.sort((a, b) => toMs(b) - toMs(a))[0];
   }
   return undefined;
 }

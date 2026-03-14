@@ -225,6 +225,14 @@ export function buildPixelState(snapshot: ReadModelSnapshot): PixelState {
   const entities = [...entitiesById.values()].sort((a, b) => a.id.localeCompare(b.id));
   const links = [...linksById.values()].sort((a, b) => a.id.localeCompare(b.id));
 
+  const entityCounts = { projects: 0, tasks: 0, sessions: 0, agents: 0 };
+  for (const e of entities) {
+    if (e.kind === "project") entityCounts.projects++;
+    else if (e.kind === "task") entityCounts.tasks++;
+    else if (e.kind === "session") entityCounts.sessions++;
+    else if (e.kind === "agent") entityCounts.agents++;
+  }
+
   return {
     generatedAt,
     snapshotGeneratedAt: snapshot.generatedAt,
@@ -235,10 +243,7 @@ export function buildPixelState(snapshot: ReadModelSnapshot): PixelState {
       rooms: rooms.length,
       entities: entities.length,
       links: links.length,
-      projects: entities.filter((entity) => entity.kind === "project").length,
-      tasks: entities.filter((entity) => entity.kind === "task").length,
-      sessions: entities.filter((entity) => entity.kind === "session").length,
-      agents: entities.filter((entity) => entity.kind === "agent").length,
+      ...entityCounts,
     },
   };
 }

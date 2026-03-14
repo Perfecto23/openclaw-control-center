@@ -151,11 +151,11 @@ const DOC_HUB_DIR_CANDIDATES = [
   { dir: join(process.cwd(), "runtime", "evidence"), category: "证据报告" },
 ];
 const DOC_HUB_CHAT_INDEX_PATH = join(process.cwd(), "runtime", "doc-hub-chat.json");
-const HTML_HEAVY_CACHE_TTL_MS = 3_000;
-const HTML_USAGE_CACHE_TTL_MS = 10_000;
+const HTML_HEAVY_CACHE_TTL_MS = 30_000;
+const HTML_USAGE_CACHE_TTL_MS = 30_000;
 const HTML_SNAPSHOT_CACHE_TTL_MS = 10_000;
-const HTML_LIVE_SESSIONS_CACHE_TTL_MS = POLLING_INTERVALS_MS.sessionsList;
-const HTML_REPLAY_CACHE_TTL_MS = 10_000;
+const HTML_LIVE_SESSIONS_CACHE_TTL_MS = 30_000;
+const HTML_REPLAY_CACHE_TTL_MS = 30_000;
 const JSON_MAX_BYTES = 128 * 1024;
 const FORM_MAX_BYTES = 16 * 1024;
 const EDITABLE_TEXT_FILE_MAX_BYTES = 1024 * 1024;
@@ -2209,6 +2209,16 @@ async function loadOpenclawCronCatalog(language: UiLanguage): Promise<OpenclawCr
 
 async function countRecentToolCalls(snapshot: ReadModelSnapshot, toolClient: ToolClient): Promise<number> {
   if (!Array.isArray(snapshot.sessions) || snapshot.sessions.length === 0) return 0;
+  // Reuse session preview cache if available (same snapshot), avoids re-reading history files
+  const previewItems = renderSessionPreviewCache?.snapshotAt === snapshot.generatedAt
+    ? renderSessionPreviewCache.value.items
+    : undefined;
+  if (previewItems) {
+    return previewItems.reduce((sum, item) => {
+      if (typeof item.toolEventCount === "number") return sum + item.toolEventCount;
+      return sum + (item.latestKind === "tool_event" ? 1 : 0);
+    }, 0);
+  }
   const recentSessions = await listSessionConversations({
     snapshot,
     client: toolClient,
@@ -3924,7 +3934,6 @@ async function loadCachedTaskEvidenceSessions(
   const now = Date.now();
   if (
     renderTaskEvidenceCache &&
-    renderTaskEvidenceCache.snapshotAt === snapshot.generatedAt &&
     renderTaskEvidenceCache.historyLimit === historyLimit &&
     renderTaskEvidenceCache.sessionKey === cacheKey &&
     renderTaskEvidenceCache.expiresAt > now
@@ -3947,7 +3956,6 @@ async function loadCachedSessionPreview(snapshot: ReadModelSnapshot, toolClient:
   const now = Date.now();
   if (
     renderSessionPreviewCache &&
-    renderSessionPreviewCache.snapshotAt === snapshot.generatedAt &&
     renderSessionPreviewCache.expiresAt > now
   ) {
     return renderSessionPreviewCache.value;
@@ -3970,22 +3978,7 @@ async function loadCachedSessionPreview(snapshot: ReadModelSnapshot, toolClient:
 }
 
 function buildUsageCostCacheKey(snapshot: ReadModelSnapshot, mode: UsageCostMode): string {
-  const sessionStamp = snapshot.sessions
-    .map((item) => [item.sessionKey, item.agentId ?? "", item.state, item.lastMessageAt ?? "", item.label ?? ""].join(":"))
-    .join("|");
-  const statusStamp = snapshot.statuses
-    .map((item) =>
-      [
-        item.sessionKey,
-        item.model ?? "",
-        String(item.tokensIn ?? 0),
-        String(item.tokensOut ?? 0),
-        String(item.cost ?? 0),
-        item.updatedAt ?? "",
-      ].join(":"),
-    )
-    .join("|");
-  return `${mode}|${sessionStamp}|${statusStamp}`;
+  return `${mode}|${snapshot.generatedAt}`;
 }
 
 async function loadCachedUsageCost(
@@ -8798,22 +8791,20 @@ async function listFileEntries(dir: string): Promise<Array<{ name: string; path:
   try {
     const rows = await readdir(dir, { withFileTypes: true });
     const files = rows.filter((row) => row.isFile());
-    const result: Array<{ name: string; path: string; updatedAt: string; size: number }> = [];
-    for (const file of files) {
-      const fullPath = join(dir, file.name);
-      try {
-        const meta = await stat(fullPath);
-        result.push({
-          name: file.name,
-          path: fullPath,
-          updatedAt: meta.mtime.toISOString(),
-          size: meta.size,
-        });
-      } catch {
-        continue;
-      }
-    }
-    return result.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const entries = await Promise.all(
+      files.map(async (file) => {
+        const fullPath = join(dir, file.name);
+        try {
+          const meta = await stat(fullPath);
+          return { name: file.name, path: fullPath, updatedAt: meta.mtime.toISOString(), size: meta.size };
+        } catch {
+          return null;
+        }
+      }),
+    );
+    return entries
+      .filter((e): e is { name: string; path: string; updatedAt: string; size: number } => e !== null)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   } catch {
     return [];
   }
@@ -10129,7 +10120,6 @@ async function loadCachedStaffRecentActivity(
   const agentKey = [...new Set(agentIds.map((value) => normalizeLookupKey(value)).filter(Boolean))].sort().join(",");
   if (
     renderStaffRecentActivityCache &&
-    renderStaffRecentActivityCache.snapshotAt === snapshot.generatedAt &&
     renderStaffRecentActivityCache.language === language &&
     renderStaffRecentActivityCache.agentKey === agentKey &&
     renderStaffRecentActivityCache.expiresAt > now

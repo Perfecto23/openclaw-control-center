@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   BudgetThresholds,
@@ -10,6 +10,9 @@ import type {
 const RUNTIME_DIR = join(process.cwd(), "runtime");
 export const PROJECTS_PATH = join(RUNTIME_DIR, "projects.json");
 const DEFAULT_WARN_RATIO = 0.8;
+const PROJECT_STORE_CACHE_TTL_MS = 5_000;
+
+let projectStoreCache: { value: ProjectStoreSnapshot; expiresAt: number; mtimeMs: number } | undefined;
 const PROJECT_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
 
 export const PROJECT_STATES: ProjectState[] = ["planned", "active", "blocked", "done"];
@@ -51,15 +54,28 @@ export interface ProjectMutationResult {
 }
 
 export async function loadProjectStore(): Promise<ProjectStoreSnapshot> {
+  const now = Date.now();
+  if (projectStoreCache && projectStoreCache.expiresAt > now) {
+    try {
+      const fileStat = await stat(PROJECTS_PATH);
+      if (fileStat.mtimeMs <= projectStoreCache.mtimeMs) return projectStoreCache.value;
+    } catch {
+      return projectStoreCache.value;
+    }
+  }
   try {
+    const fileStat = await stat(PROJECTS_PATH);
     const raw = await readFile(PROJECTS_PATH, "utf8");
-    return normalizeProjectStore(JSON.parse(raw));
+    const value = normalizeProjectStore(JSON.parse(raw));
+    projectStoreCache = { value, expiresAt: now + PROJECT_STORE_CACHE_TTL_MS, mtimeMs: fileStat.mtimeMs };
+    return value;
   } catch {
     return cloneEmptyStore();
   }
 }
 
 export async function saveProjectStore(next: ProjectStoreSnapshot): Promise<string> {
+  projectStoreCache = undefined;
   const normalized = normalizeProjectStore({
     ...next,
     updatedAt: new Date().toISOString(),

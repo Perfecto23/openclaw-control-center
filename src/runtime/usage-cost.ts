@@ -589,27 +589,32 @@ async function loadUsageDigests(): Promise<UsageDigest[]> {
   }
 
   const jsonFiles = files.filter((name) => name.endsWith(".json")).sort((a, b) => b.localeCompare(a));
+  const results = await Promise.all(
+    jsonFiles.map(async (fileName) => {
+      try {
+        return JSON.parse(await readFile(join(DIGEST_DIR, fileName), "utf8")) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    }),
+  );
   const digests: UsageDigest[] = [];
-  for (const fileName of jsonFiles) {
-    try {
-      const raw = JSON.parse(await readFile(join(DIGEST_DIR, fileName), "utf8")) as Record<string, unknown>;
-      const date = asString(raw.date) ?? fileName.slice(0, -5);
-      const usage = asObject(raw.usage);
-      if (!usage) continue;
-      digests.push({
-        date,
-        usage: {
-          statuses: asNumber(usage.statuses),
-          totalTokensIn: asNumber(usage.totalTokensIn),
-          totalTokensOut: asNumber(usage.totalTokensOut),
-          totalCost: asNumber(usage.totalCost),
-        },
-      });
-    } catch {
-      continue;
-    }
+  for (let i = 0; i < results.length; i++) {
+    const raw = results[i];
+    if (!raw) continue;
+    const date = asString(raw.date) ?? jsonFiles[i].slice(0, -5);
+    const usage = asObject(raw.usage);
+    if (!usage) continue;
+    digests.push({
+      date,
+      usage: {
+        statuses: asNumber(usage.statuses),
+        totalTokensIn: asNumber(usage.totalTokensIn),
+        totalTokensOut: asNumber(usage.totalTokensOut),
+        totalCost: asNumber(usage.totalCost),
+      },
+    });
   }
-
   return digests;
 }
 

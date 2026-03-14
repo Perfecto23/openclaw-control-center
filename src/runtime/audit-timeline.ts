@@ -37,12 +37,7 @@ export async function loadAuditTimeline(snapshot: ReadModelSnapshot): Promise<Au
   return {
     generatedAt: new Date().toISOString(),
     events,
-    counts: {
-      info: events.filter((item) => item.severity === "info").length,
-      warn: events.filter((item) => item.severity === "warn").length,
-      "action-required": events.filter((item) => item.severity === "action-required").length,
-      error: events.filter((item) => item.severity === "error").length,
-    },
+    counts: countBySeverity(events),
   };
 }
 
@@ -56,12 +51,7 @@ export function filterAuditTimeline(
   return {
     generatedAt: timeline.generatedAt,
     events,
-    counts: {
-      info: events.filter((item) => item.severity === "info").length,
-      warn: events.filter((item) => item.severity === "warn").length,
-      "action-required": events.filter((item) => item.severity === "action-required").length,
-      error: events.filter((item) => item.severity === "error").length,
-    },
+    counts: countBySeverity(events),
   };
 }
 
@@ -268,4 +258,10 @@ function severityRank(severity: AuditSeverity): number {
 
 function asString(input: unknown): string | undefined {
   return typeof input === "string" ? input : undefined;
+}
+
+function countBySeverity(events: AuditTimelineEvent[]): Record<AuditSeverity, number> {
+  const counts: Record<AuditSeverity, number> = { info: 0, warn: 0, "action-required": 0, error: 0 };
+  for (const e of events) counts[e.severity]++;
+  return counts;
 }

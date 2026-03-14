@@ -27,11 +27,15 @@ export function computeBudgetSummary(
   const agentBySessionKey = buildAgentMap(sessions);
   const projectById = new Map(projects.projects.map((project) => [project.projectId, project]));
 
+  const sessionsByAgent = new Map<string, string[]>();
+  for (const [sessionKey, agentId] of agentBySessionKey.entries()) {
+    const arr = sessionsByAgent.get(agentId) ?? [];
+    arr.push(sessionKey);
+    sessionsByAgent.set(agentId, arr);
+  }
+
   for (const agentBudget of tasks.agentBudgets) {
-    const keys: string[] = [];
-    for (const [sessionKey, agentId] of agentBySessionKey.entries()) {
-      if (agentId === agentBudget.agentId) keys.push(sessionKey);
-    }
+    const keys = sessionsByAgent.get(agentBudget.agentId) ?? [];
 
     evaluations.push(
       evaluateBudget(
@@ -79,11 +83,14 @@ export function computeBudgetSummary(
     );
   }
 
+  const counts = { ok: 0, warn: 0, over: 0 };
+  for (const e of evaluations) counts[e.status]++;
+
   return {
     total: evaluations.length,
-    ok: evaluations.filter((item) => item.status === "ok").length,
-    warn: evaluations.filter((item) => item.status === "warn").length,
-    over: evaluations.filter((item) => item.status === "over").length,
+    ok: counts.ok,
+    warn: counts.warn,
+    over: counts.over,
     evaluations,
   };
 }
