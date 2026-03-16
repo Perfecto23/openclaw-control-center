@@ -61,6 +61,7 @@ const FALLBACK_ACTIVE_RECENCY_WINDOW_MS = 45 * 60 * 1000;
 const SESSION_HISTORY_TAIL_MIN_LINES = 80;
 const SESSION_HISTORY_TAIL_LINE_MULTIPLIER = 8;
 const SESSION_HISTORY_TAIL_CHUNK_BYTES = 64 * 1024;
+const SESSION_HISTORY_RECOVERY_TIMEOUT_MS = 1_500;
 
 /**
  * Live read client using official OpenClaw CLI JSON outputs.
@@ -145,31 +146,13 @@ export class OpenClawLiveClient implements ToolClient {
     if (sessionFile) {
       const fromFile = await readSessionHistoryFile(sessionFile, limit);
       if (fromFile) return fromFile;
+      // Cached/session-store file paths can go stale. Try a bounded CLI
+      // recovery path before giving up so we do not silently swallow history.
+      return readSessionHistoryFromCli(sessionKey, limit, {
+        timeoutMs: SESSION_HISTORY_RECOVERY_TIMEOUT_MS,
+      });
     }
-    const attempts: string[][] = [
-      ["sessions", "history", sessionKey, "--json", "--limit", String(limit)],
-      ["sessions", "history", sessionKey, "--limit", String(limit), "--json"],
-      ["sessions", "history", sessionKey, "--json"],
-    ];
-
-    for (const args of attempts) {
-      try {
-        const json = await runJson<Record<string, unknown>>(args);
-        return {
-          json,
-          rawText: JSON.stringify(json),
-        };
-      } catch {
-        continue;
-      }
-    }
-
-    try {
-      const rawText = await runHistoryText(sessionKey, limit);
-      return normalizeRawHistoryText(rawText, limit);
-    } catch {
-      return { rawText: "" };
-    }
+    return readSessionHistoryFromCli(sessionKey, limit);
   }
 
   async cronList(): Promise<CronListResponse> {
@@ -371,18 +354,54 @@ async function runText(
   const { stdout } = await execFileAsync("openclaw", args, {
     timeout: options?.timeoutMs ?? 20_000,
     maxBuffer: options?.maxBuffer ?? 2 * 1024 * 1024,
+    shell: process.platform === "win32",
   });
   return stdout;
 }
 
-async function runHistoryText(sessionKey: string, limit: number): Promise<string> {
+async function readSessionHistoryFromCli(
+  sessionKey: string,
+  limit: number,
+  options?: { timeoutMs?: number },
+): Promise<SessionsHistoryResponse> {
+  const attempts: string[][] = [
+    ["sessions", "history", sessionKey, "--json", "--limit", String(limit)],
+    ["sessions", "history", sessionKey, "--limit", String(limit), "--json"],
+    ["sessions", "history", sessionKey, "--json"],
+  ];
+
+  for (const args of attempts) {
+    try {
+      const json = await runJson<Record<string, unknown>>(args, { timeoutMs: options?.timeoutMs });
+      return {
+        json,
+        rawText: JSON.stringify(json),
+      };
+    } catch {
+      continue;
+    }
+  }
+
   try {
-    return await runText(["sessions", "history", sessionKey, "--limit", String(limit)]);
+    const rawText = await runHistoryText(sessionKey, limit, options);
+    return normalizeRawHistoryText(rawText, limit);
+  } catch {
+    return { rawText: "" };
+  }
+}
+
+async function runHistoryText(
+  sessionKey: string,
+  limit: number,
+  options?: { timeoutMs?: number; maxBuffer?: number },
+): Promise<string> {
+  try {
+    return await runText(["sessions", "history", sessionKey, "--limit", String(limit)], options);
   } catch (error) {
     if (!isUnknownLimitOptionError(error)) throw error;
   }
 
-  const rawText = await runText(["sessions", "history", sessionKey]);
+  const rawText = await runText(["sessions", "history", sessionKey], options);
   const trimmed = rawText.trim();
   if (trimmed === "") return rawText;
   const lines = trimmed.split(/\r?\n/);

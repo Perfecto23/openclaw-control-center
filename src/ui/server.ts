@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import {
@@ -105,12 +106,22 @@ import {
   type SessionConversationFilters,
   type SessionConversationListItem,
   type SessionHistoryMessage,
+  type SessionInterSessionSignal,
 } from "../runtime/session-conversations";
 import { loadBestEffortAgentRoster, type AgentRosterEntry, type AgentRosterSnapshot } from "../runtime/agent-roster";
 import {
   loadBestEffortOfficeSessionPresence,
   type OfficeSessionPresenceSnapshot,
 } from "../runtime/office-session-presence";
+import {
+  AVATAR_UPLOADS_DIR,
+  loadAvatarPreferences,
+  listAvatarUploads,
+  resolveEffectiveAvatar,
+  saveAvatarPreferences,
+  upsertAgentAvatarPreference,
+  type AvatarMode,
+} from "../runtime/avatar-preferences";
 import type {
   AgentRunState,
   BudgetEvaluation,
@@ -127,13 +138,15 @@ import type {
 
 const SNAPSHOT_PATH = join(process.cwd(), "runtime", "last-snapshot.json");
 const OPENCLAW_HOME_DIR = process.env.OPENCLAW_HOME?.trim() || join(homedir(), ".openclaw");
+const OPENCLAW_CONFIG_PATH = process.env.OPENCLAW_CONFIG_PATH?.trim() || join(OPENCLAW_HOME_DIR, "openclaw.json");
+const OPENCLAW_CONFIG_DIR = dirname(OPENCLAW_CONFIG_PATH);
 const OPENCLAW_CRON_JOBS_CANDIDATES = [
   join(OPENCLAW_HOME_DIR, "cron", "jobs.json"),
   join(process.cwd(), "..", "..", "..", "..", "cron", "jobs.json"),
 ];
 const DOCS_DIR = join(process.cwd(), "docs");
 const README_PATH = join(process.cwd(), "README.md");
-const AGENT_ROOT_DIR = join(process.cwd(), "..");
+const AGENT_ROOT_DIR = process.env.OPENCLAW_AGENT_ROOT?.trim() || join(process.cwd(), "..");
 const MEMORY_DIR_CANDIDATES = [
   join(AGENT_ROOT_DIR, "memory"),
   join(process.cwd(), "runtime", "digests"),
@@ -160,10 +173,15 @@ const JSON_MAX_BYTES = 128 * 1024;
 const FORM_MAX_BYTES = 16 * 1024;
 const EDITABLE_TEXT_FILE_MAX_BYTES = 1024 * 1024;
 const EDITABLE_TEXT_CONTENT_MAX_CHARS = 240_000;
+const AVATAR_UPLOAD_MAX_BYTES = 2 * 1024 * 1024;
 const SEARCH_LIMIT_MAX = 200;
 const TASK_RUNTIME_ACTIVITY_WINDOW_MS = 6 * 60 * 60 * 1000;
 const STALLED_RUNNING_SESSION_WINDOW_MS = 2 * 60 * 60 * 1000;
-const OPENCLAW_WORKSPACE_ROOT = resolve(process.cwd(), "..", "..", "..");
+const OPENCLAW_WORKSPACE_ROOT = resolveOpenClawWorkspaceRoot({
+  explicitWorkspaceRoot: process.env.OPENCLAW_WORKSPACE_ROOT?.trim(),
+  openclawHomeDir: OPENCLAW_HOME_DIR,
+  configPath: OPENCLAW_CONFIG_PATH,
+});
 const WORKSPACE_EDITABLE_SKIP_DIRS = new Set(["node_modules", ".git", "dist", "coverage"]);
 const WORKSPACE_EDITABLE_EXTENSIONS = new Set([".md", ".markdown"]);
 const MEMORY_EDITABLE_EXTENSIONS = new Set([".md", ".markdown", ".txt"]);
@@ -171,6 +189,8 @@ const SHARED_DOCUMENT_FILE_CANDIDATES = [
   "AGENTS.md",
   "IDENTITY.md",
   "SOUL.md",
+  "USER.md",
+  "TASKS.md",
   "BOOTSTRAP.md",
   "HEARTBEAT.md",
   "TOOLS.md",
@@ -181,6 +201,8 @@ const AGENT_DOCUMENT_FILE_CANDIDATES = [
   "AGENTS.md",
   "IDENTITY.md",
   "SOUL.md",
+  "USER.md",
+  "TASKS.md",
   "HEARTBEAT.md",
   "TOOLS.md",
   "README.md",
@@ -204,6 +226,7 @@ const DASHBOARD_SECTIONS = [
   "overview",
   "calendar",
   "team",
+  "collaboration",
   "memory",
   "docs",
   "usage-cost",
@@ -214,7 +237,6 @@ const DASHBOARD_SECTIONS = [
   "settings",
 ] as const;
 const CONTROL_CENTER_MAPPING_TASK_IDS = new Set(["due-fast", "todo-second", "already-running", "unassigned"]);
-const OPENCLAW_CONFIG_PATH = join(OPENCLAW_HOME_DIR, "openclaw.json");
 const LEGACY_DASHBOARD_ROUTE_SECTION = {
   "/calendar": "projects-tasks",
   "/heartbeat": "overview",
@@ -225,6 +247,74 @@ const LEGACY_DASHBOARD_ROUTE_ANCHOR = {
   "/heartbeat": "heartbeat-health",
   "/tools": "tool-connectors",
 } as const;
+function resolveOpenClawWorkspaceRoot(input: {
+  explicitWorkspaceRoot?: string;
+  openclawHomeDir: string;
+  configPath: string;
+}): string {
+  const explicit = input.explicitWorkspaceRoot?.trim();
+  if (explicit) return resolve(explicit);
+  const configText = safeReadTextFileSync(input.configPath);
+  const inferred = inferWorkspaceRootFromConfigText(configText, dirname(input.configPath));
+  if (inferred) return inferred;
+  return join(input.openclawHomeDir, "workspace");
+}
+
+function safeReadTextFileSync(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function inferWorkspaceRootFromConfigText(raw: string | undefined, configDir: string): string | undefined {
+  if (!raw?.trim()) return undefined;
+  try {
+    return inferWorkspaceRootFromConfigObject(JSON.parse(raw) as unknown, configDir);
+  } catch {
+    return undefined;
+  }
+}
+
+function inferWorkspaceRootFromConfigObject(input: unknown, configDir: string): string | undefined {
+  const root = asObject(input);
+  const agents = asObject(root?.agents);
+  const list = asArray(agents?.list);
+  const mainRow = list
+    .map((item) => asObject(item))
+    .find((row) => normalizeLookupKey(asString(row?.id)?.trim() ?? asString(row?.name)?.trim() ?? "") === "main");
+  const explicitMainWorkspace = asString(mainRow?.workspace)?.trim();
+  if (explicitMainWorkspace) return resolve(configDir, explicitMainWorkspace);
+
+  const inferredRoots = new Set<string>();
+  for (const item of list) {
+    const row = asObject(item);
+    const rawWorkspace = asString(row?.workspace)?.trim();
+    if (!rawWorkspace) continue;
+    const workspacePath = resolve(configDir, rawWorkspace);
+    const parentDir = dirname(workspacePath);
+    if (basename(parentDir).toLowerCase() !== "agents") continue;
+    inferredRoots.add(dirname(parentDir));
+  }
+  if (inferredRoots.size === 1) return [...inferredRoots][0];
+  return undefined;
+}
+
+export function resolveOpenClawWorkspaceRootForSmoke(input: {
+  explicitWorkspaceRoot?: string;
+  openclawHomeDir: string;
+  configText?: string;
+  configPath?: string;
+}): string {
+  const explicit = input.explicitWorkspaceRoot?.trim();
+  if (explicit) return resolve(explicit);
+  const configDir = dirname(input.configPath?.trim() || join(input.openclawHomeDir, "openclaw.json"));
+  const inferred = inferWorkspaceRootFromConfigText(input.configText, configDir);
+  if (inferred) return inferred;
+  return join(input.openclawHomeDir, "workspace");
+}
+
 const TASK_STATES: TaskState[] = ["todo", "in_progress", "blocked", "done"];
 const SESSION_STATES: AgentRunState[] = ["idle", "running", "blocked", "waiting_approval", "error"];
 const DOC_LINKS = [
@@ -237,6 +327,7 @@ const DASHBOARD_SECTION_LINKS_EN: DashboardSectionLink[] = [
   { key: "overview", label: "Overview", blurb: "Today at a glance" },
   { key: "usage-cost", label: "Usage", blurb: "Budget and quota" },
   { key: "team", label: "Staff", blurb: "Mission, staff and assignments" },
+  { key: "collaboration", label: "Collaboration", blurb: "Agent handoffs and teamwork" },
   { key: "memory", label: "Memory", blurb: "Daily and long-term memories" },
   { key: "docs", label: "Documents", blurb: "Main and active agent core docs" },
   { key: "projects-tasks", label: "Tasks", blurb: "Board, schedule and activity" },
@@ -448,6 +539,9 @@ interface EditableAgentScope {
 type EditableAgentScopeConfigStatus = "configured" | "config_missing" | "config_invalid";
 
 let renderSessionPreviewCache:
+  | { snapshotAt: string; value: SessionConversationListResult; expiresAt: number }
+  | undefined;
+let renderCollaborationPreviewCache:
   | { snapshotAt: string; value: SessionConversationListResult; expiresAt: number }
   | undefined;
 let renderUsageCostSummaryCache:
@@ -665,6 +759,63 @@ interface TaskExecutionChainCard {
   sessionHref: string;
   taskHref?: string;
   unmapped?: boolean;
+}
+
+type CollaborationThreadStatus = "active" | "handoff" | "blocked" | "completed";
+type CollaborationThreadKind = "parent_child" | "inter_session";
+
+interface CollaborationParticipant {
+  agentId: string;
+  label: string;
+  identity: AgentAnimalIdentity;
+  current: boolean;
+  roleLabel: string;
+}
+
+interface CollaborationThreadAggregateItem {
+  sessionKey: string;
+  sessionHref: string;
+  latestAt?: string;
+}
+
+interface CollaborationTimelineStep {
+  id: string;
+  agentId: string;
+  roleLabel?: string;
+  title: string;
+  detail: string;
+  at?: string;
+  tone: "ok" | "info" | "warn" | "blocked";
+}
+
+interface CollaborationThreadCard {
+  id: string;
+  kind: CollaborationThreadKind;
+  sessionKey: string;
+  taskTitle: string;
+  routeTitle: string;
+  summary: string;
+  status: CollaborationThreadStatus;
+  statusBadge: string;
+  kindBadge: string;
+  currentOwnerLabel: string;
+  currentOwnerAgentId?: string;
+  currentOwnerRole: "parent" | "child" | "source" | "target";
+  latestAt?: string;
+  latestAtLabel: string;
+  participants: CollaborationParticipant[];
+  routeJoiner: "→" | "⇄";
+  multiAgent: boolean;
+  mainDispatched: boolean;
+  aggregateCount: number;
+  aggregateItems: CollaborationThreadAggregateItem[];
+  taskHref?: string;
+  sessionHref: string;
+  timeline: CollaborationTimelineStep[];
+  latestSnippet: string;
+  sourceLabel: string;
+  parentSessionKey?: string;
+  childSessionKey?: string;
 }
 
 interface TaskRoleSummary {
@@ -1007,6 +1158,85 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
           preferences: saved.preferences,
           issues: saved.issues,
         });
+      }
+
+      if (method === "GET" && path === "/api/avatar/uploads") {
+        assertAllowedQueryParams(url.searchParams, [], true);
+        const uploads = await listAvatarUploads();
+        return writeJson(res, 200, {
+          ok: true,
+          directory: AVATAR_UPLOADS_DIR,
+          count: uploads.length,
+          uploads,
+        });
+      }
+
+      if (method === "POST" && path === "/api/avatar/uploads") {
+        assertMutationAuthorized(req, "/api/avatar/uploads");
+        assertJsonContentType(req);
+        const payload = expectObject(await readJsonBody(req), "avatar upload payload");
+        const dataUrl = optionalBoundedString(payload.dataUrl, "dataUrl", AVATAR_UPLOAD_MAX_BYTES * 2);
+        const fileNameHint = optionalBoundedString(payload.fileName, "fileName", 160);
+        if (!dataUrl) {
+          throw new RequestValidationError("dataUrl is required.", 400);
+        }
+        const saved = await writeAvatarUploadFromDataUrl({ dataUrl, fileNameHint });
+        return writeJson(res, 200, { ok: true, upload: saved });
+      }
+
+      if (method === "DELETE" && path.startsWith("/api/avatar/uploads/")) {
+        assertMutationAuthorized(req, "/api/avatar/uploads/:fileName");
+        assertAllowedQueryParams(url.searchParams, [], true);
+        const fileName = decodeURIComponent(path.slice("/api/avatar/uploads/".length));
+        const removed = await deleteAvatarUpload(fileName);
+        if (!removed) return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
+        return writeJson(res, 200, { ok: true, removed: fileName });
+      }
+
+      if (method === "GET" && path === "/api/avatar/preferences") {
+        assertAllowedQueryParams(url.searchParams, ["agentId"], true);
+        const agentId = normalizeQueryString(url.searchParams.get("agentId"), "agentId", 160, true);
+        const prefs = await loadAvatarPreferences();
+        const entry = agentId ? prefs.preferences.agents[agentId] ?? null : null;
+        return writeJson(res, 200, {
+          ok: true,
+          path: prefs.path,
+          agentId: agentId ?? null,
+          preference: entry,
+          preferencesUpdatedAt: prefs.preferences.updatedAt,
+          issues: prefs.issues,
+        });
+      }
+
+      if (method === "PATCH" && path === "/api/avatar/preferences") {
+        assertMutationAuthorized(req, "/api/avatar/preferences");
+        assertJsonContentType(req);
+        const payload = expectObject(await readJsonBody(req), "avatar preference payload");
+        const agentId = optionalBoundedString(payload.agentId, "agentId", 160);
+        const mode = optionalBoundedString(payload.mode, "mode", 24)?.trim().toLowerCase() as AvatarMode | undefined;
+        const animal = optionalBoundedString(payload.animal, "animal", 64);
+        const image = optionalBoundedString(payload.image, "image", 240);
+        if (!agentId) throw new RequestValidationError("agentId is required.", 400);
+        if (!mode || (mode !== "agent" && mode !== "pixel" && mode !== "custom")) {
+          throw new RequestValidationError("mode must be one of: agent, pixel, custom", 400);
+        }
+        const current = await loadAvatarPreferences();
+        const merged = upsertAgentAvatarPreference({
+          preferences: current.preferences,
+          agentId,
+          mode,
+          animal,
+          image,
+          now: new Date().toISOString(),
+        });
+        const saved = await saveAvatarPreferences(merged);
+        return writeJson(res, 200, { ok: true, path: saved.path, preferences: saved.preferences, issues: saved.issues });
+      }
+
+      if (method === "GET" && path.startsWith("/avatars/")) {
+        assertAllowedQueryParams(url.searchParams, [], true);
+        const fileName = decodeURIComponent(path.slice("/avatars/".length));
+        return await serveAvatarFile(res, fileName);
       }
 
       if (method === "GET" && path === "/api/search/tasks") {
@@ -1445,7 +1675,7 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
           sessionKey: detail.sessionKey,
           agentId: detail.agentId,
           state: detail.state,
-          latestAt: detail.latestHistoryAt ?? detail.lastMessageAt,
+          latestAt: pickLatestSessionActivityTimestamp(detail.latestHistoryAt, detail.lastMessageAt),
           latestSnippet: detail.latestSnippet,
           sessionHref: buildSessionDetailHref(detail.sessionKey, language),
         }));
@@ -1675,8 +1905,10 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
     }
   });
 
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`[mission-control] ui listening at http://127.0.0.1:${port}`);
+  const bindAddress = process.env.UI_BIND_ADDRESS ?? "127.0.0.1";
+  server.listen(port, bindAddress, () => {
+    const displayUrl = bindAddress === "0.0.0.0" ? `http://<your-ip>:${port}` : `http://${bindAddress}:${port}`;
+    console.log(`[mission-control] ui listening at ${displayUrl}`);
     void Promise.resolve().then(() => primeOpenClawCliInsights());
     void primeUiRenderCaches(toolClient);
   });
@@ -2439,6 +2671,9 @@ function dashboardSectionLinks(language: UiLanguage): DashboardSectionLink[] {
     }
     if (item.key === "team") {
       return { ...item, label: "员工", blurb: "员工、分工与职责" };
+    }
+    if (item.key === "collaboration") {
+      return { ...item, label: "协作", blurb: "智能体交接与协同" };
     }
     if (item.key === "memory") {
       return { ...item, label: "记忆", blurb: "每日与长期记忆" };
@@ -3581,6 +3816,18 @@ function pickLatestTimestamp(values: Array<string | undefined>): string | undefi
   return latestValue;
 }
 
+function isSameLocalCalendarDay(value: string | undefined, nowMs: number): boolean {
+  const parsed = toSortableMs(value);
+  if (!parsed) return false;
+  const a = new Date(parsed);
+  const b = new Date(nowMs);
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
 function hasFreshRuntimeTimestamp(value: string | undefined, nowMs: number, windowMs: number): boolean {
   const parsed = toSortableMs(value);
   return parsed > 0 && nowMs - parsed <= windowMs;
@@ -3591,6 +3838,18 @@ function isStaleRuntimeTimestamp(value: string | undefined, nowMs: number, windo
   return parsed > 0 && nowMs - parsed > windowMs;
 }
 
+function pickLatestSessionActivityTimestamp(...values: Array<string | undefined>): string | undefined {
+  let latest: string | undefined;
+  let latestMs = Number.NEGATIVE_INFINITY;
+  for (const value of values) {
+    const parsed = toSortableMs(value);
+    if (parsed <= 0 || parsed <= latestMs) continue;
+    latest = value;
+    latestMs = parsed;
+  }
+  return latest;
+}
+
 function countStalledRunningSessions(
   sessions: ReadModelSnapshot["sessions"],
   sessionItems: SessionConversationListItem[],
@@ -3598,11 +3857,17 @@ function countStalledRunningSessions(
   windowMs = STALLED_RUNNING_SESSION_WINDOW_MS,
 ): number {
   const latestBySessionKey = new Map(
-    sessionItems.map((item) => [item.sessionKey, item.latestHistoryAt ?? item.lastMessageAt]),
+    sessionItems.map((item) => [
+      item.sessionKey,
+      pickLatestSessionActivityTimestamp(item.latestHistoryAt, item.lastMessageAt),
+    ]),
   );
   return sessions.filter((session) => {
     if (session.state !== "running") return false;
-    const latestAt = latestBySessionKey.get(session.sessionKey) ?? session.lastMessageAt;
+    const latestAt = pickLatestSessionActivityTimestamp(
+      latestBySessionKey.get(session.sessionKey),
+      session.lastMessageAt,
+    );
     return isStaleRuntimeTimestamp(latestAt, nowMs, windowMs);
   }).length;
 }
@@ -3646,7 +3911,11 @@ function buildTaskCertaintyCards(input: {
         if (state === "blocked") blockedSessionCount += 1;
         if (state === "error") errorSessionCount += 1;
         if (state === "waiting_approval") waitingApprovalSessionCount += 1;
-        const latestAt = preview?.latestHistoryAt ?? preview?.lastMessageAt ?? snapshotSession?.lastMessageAt;
+        const latestAt = pickLatestSessionActivityTimestamp(
+          preview?.latestHistoryAt,
+          preview?.lastMessageAt,
+          snapshotSession?.lastMessageAt,
+        );
         signalTimes.push(latestAt);
         if (hasFreshRuntimeTimestamp(latestAt, nowMs, TASK_RUNTIME_ACTIVITY_WINDOW_MS)) {
           recentActivityCount += 1;
@@ -3876,10 +4145,100 @@ function mergeSessionConversationItems(
 ): SessionConversationListItem[] {
   const merged = new Map<string, SessionConversationListItem>();
   for (const item of [...primary, ...secondary]) {
-    if (!item.sessionKey.trim() || merged.has(item.sessionKey)) continue;
-    merged.set(item.sessionKey, item);
+    const sessionKey = item.sessionKey.trim();
+    if (!sessionKey) continue;
+    const existing = merged.get(sessionKey);
+    merged.set(sessionKey, existing ? mergeSessionConversationItem(existing, item) : item);
   }
   return [...merged.values()];
+}
+
+function mergeSessionConversationItem(
+  existing: SessionConversationListItem,
+  incoming: SessionConversationListItem,
+): SessionConversationListItem {
+  return {
+    ...existing,
+    ...incoming,
+    label: incoming.label ?? existing.label,
+    agentId: incoming.agentId ?? existing.agentId,
+    state: incoming.state ?? existing.state,
+    lastMessageAt: pickLatestTimestamp([existing.lastMessageAt, incoming.lastMessageAt]) ?? incoming.lastMessageAt ?? existing.lastMessageAt,
+    taskSnippet: pickRicherSessionText(existing.taskSnippet, incoming.taskSnippet),
+    latestSnippet: pickRicherSessionText(existing.latestSnippet, incoming.latestSnippet),
+    latestRole: incoming.latestRole ?? existing.latestRole,
+    latestKind: incoming.latestKind ?? existing.latestKind,
+    latestToolName: incoming.latestToolName ?? existing.latestToolName,
+    latestHistoryAt: pickLatestTimestamp([existing.latestHistoryAt, incoming.latestHistoryAt]) ?? incoming.latestHistoryAt ?? existing.latestHistoryAt,
+    historyCount: Math.max(existing.historyCount, incoming.historyCount),
+    toolEventCount: Math.max(existing.toolEventCount, incoming.toolEventCount),
+    historyError: existing.historyError || incoming.historyError,
+    executionChain:
+      existing.executionChain && incoming.executionChain
+        ? mergeExecutionChainSummaries(existing.executionChain, incoming.executionChain)
+        : incoming.executionChain ?? existing.executionChain,
+    interSessionSignals: mergeInterSessionSignals(existing.interSessionSignals, incoming.interSessionSignals),
+  };
+}
+
+function pickRicherSessionText(current: string | undefined, incoming: string | undefined): string | undefined {
+  const currentText = normalizeInlineText(current ?? "");
+  const incomingText = normalizeInlineText(incoming ?? "");
+  if (!currentText) return incomingText || undefined;
+  if (!incomingText) return currentText || undefined;
+  if (incomingText.length > currentText.length) return incomingText;
+  return currentText;
+}
+
+function mergeExecutionChainSummaries(
+  current: SessionExecutionChainSummary,
+  incoming: SessionExecutionChainSummary,
+): SessionExecutionChainSummary {
+  const chosenStage =
+    executionChainStageRank(incoming.stage) >= executionChainStageRank(current.stage) ? incoming.stage : current.stage;
+  return {
+    accepted: current.accepted || incoming.accepted,
+    acceptedAt: pickLatestTimestamp([current.acceptedAt, incoming.acceptedAt]) ?? incoming.acceptedAt ?? current.acceptedAt,
+    spawned: current.spawned || incoming.spawned,
+    spawnedAt: pickLatestTimestamp([current.spawnedAt, incoming.spawnedAt]) ?? incoming.spawnedAt ?? current.spawnedAt,
+    parentSessionKey: incoming.parentSessionKey ?? current.parentSessionKey,
+    childSessionKey: incoming.childSessionKey ?? current.childSessionKey,
+    stage: chosenStage,
+    source: incoming.source === "history" || current.source !== "history" ? incoming.source : current.source,
+    inferred: current.inferred && incoming.inferred,
+    detail: pickRicherSessionText(current.detail, incoming.detail) ?? incoming.detail,
+  };
+}
+
+function mergeInterSessionSignals(
+  current: SessionInterSessionSignal[] | undefined,
+  incoming: SessionInterSessionSignal[] | undefined,
+): SessionInterSessionSignal[] | undefined {
+  const items = [...(current ?? []), ...(incoming ?? [])];
+  if (items.length === 0) return undefined;
+  const merged = new Map<string, SessionInterSessionSignal>();
+  for (const item of items) {
+    const key = [
+      normalizeLookupKey(item.sourceSessionKey),
+      normalizeLookupKey(item.sourceTool ?? ""),
+      normalizeLookupKey(item.timestamp ?? ""),
+      normalizeLookupKey(item.snippet),
+    ].join("::");
+    if (!merged.has(key)) merged.set(key, item);
+  }
+  return [...merged.values()].sort((a, b) => toSortableMs(a.timestamp) - toSortableMs(b.timestamp));
+}
+
+function pickSessionTaskSnippet(history: SessionHistoryMessage[]): string | undefined {
+  const candidates = history.filter(
+    (item) => (item.kind === "message" || item.kind === "inter_session") && item.content.trim(),
+  );
+  const preferred =
+    candidates.find((item) => /user|system/i.test(item.role)) ??
+    candidates.find((item) => !/assistant|tool/i.test(item.role)) ??
+    candidates[0];
+  const normalized = normalizeInlineText(preferred?.content ?? "");
+  return normalized || undefined;
 }
 
 async function loadSessionConversationItemsByKeys(
@@ -3911,6 +4270,7 @@ async function loadSessionConversationItemsByKeys(
       agentId: detail.session.agentId,
       state: detail.session.state,
       lastMessageAt: detail.session.lastMessageAt,
+      taskSnippet: pickSessionTaskSnippet(detail.history),
       latestSnippet: detail.latestSnippet,
       latestRole: detail.latestRole,
       latestKind: detail.latestKind,
@@ -3920,6 +4280,14 @@ async function loadSessionConversationItemsByKeys(
       toolEventCount: detail.history.filter((item) => item.kind === "tool_event").length,
       historyError: detail.historyError,
       executionChain: detail.executionChain,
+      interSessionSignals: detail.history
+        .filter((item) => item.kind === "inter_session" && (item.sourceSessionKey ?? "").trim())
+        .map((item) => ({
+          sourceSessionKey: item.sourceSessionKey!.trim(),
+          sourceTool: item.sourceTool,
+          timestamp: item.timestamp,
+          snippet: safeTruncate(normalizeInlineText(item.content), 220),
+        })),
     }));
 }
 
@@ -3967,7 +4335,7 @@ async function loadCachedSessionPreview(snapshot: ReadModelSnapshot, toolClient:
     filters: {},
     page: 1,
     pageSize: 12,
-    historyLimit: 10,
+    historyLimit: 5,
   });
   renderSessionPreviewCache = {
     snapshotAt: snapshot.generatedAt,
@@ -3977,8 +4345,49 @@ async function loadCachedSessionPreview(snapshot: ReadModelSnapshot, toolClient:
   return value;
 }
 
+async function loadCachedCollaborationPreview(
+  snapshot: ReadModelSnapshot,
+  toolClient: ToolClient,
+): Promise<SessionConversationListResult> {
+  const now = Date.now();
+  if (
+    renderCollaborationPreviewCache &&
+    renderCollaborationPreviewCache.snapshotAt === snapshot.generatedAt &&
+    renderCollaborationPreviewCache.expiresAt > now
+  ) {
+    return renderCollaborationPreviewCache.value;
+  }
+
+  const value = await listSessionConversations({
+    snapshot,
+    client: toolClient,
+    filters: {},
+    page: 1,
+    pageSize: 40,
+    historyLimit: 8,
+  });
+  renderCollaborationPreviewCache = {
+    snapshotAt: snapshot.generatedAt,
+    value,
+    expiresAt: now + HTML_HEAVY_CACHE_TTL_MS,
+  };
+  return value;
+}
+
 function buildUsageCostCacheKey(snapshot: ReadModelSnapshot, mode: UsageCostMode): string {
-  return `${mode}|${snapshot.generatedAt}`;
+  // Content-based fingerprint – changes only when session/status data
+  // actually changes, unlike generatedAt which changes every poll cycle.
+  // Session state (running→idle etc.) affects the output (contextWindows
+  // rows use session.state), so we include it alongside status timestamps.
+  const sessionFingerprint = snapshot.sessions
+    .map((s) => `${s.sessionKey}:${s.state}`)
+    .sort()
+    .join(";");
+  const statusFingerprint = snapshot.statuses
+    .map((s) => `${s.sessionKey}:${s.updatedAt}`)
+    .sort()
+    .join(";");
+  return `${mode}|${sessionFingerprint}|${statusFingerprint}`;
 }
 
 async function loadCachedUsageCost(
@@ -4170,14 +4579,20 @@ async function renderHtml(
           "Decide from one screen: system health, items needing your intervention, who is active, and AI burn.",
           "一个首页只回答四件事：系统是否正常、哪里需要你介入、谁在忙、AI 用量是否异常。",
         )
+      : activeSection === "collaboration"
+        ? t(
+            "Follow how work moves between agents: who accepted it, who received the handoff, and where collaboration is currently waiting.",
+            "直接看任务是怎么在智能体之间流转的：谁先接单、后来交给了谁、当前卡在哪一段协作里。",
+          )
       : activeSection === "projects-tasks"
         ? t(
             "Start with schedule and cron execution. Staff can be active from cron or ad-hoc sessions even when there is no tracked task row yet.",
             "先看排程和 Cron 执行。员工显示在工作，可能只是 Cron 或临时会话在跑，不一定已经落成可跟踪的任务条目。",
           )
         : sectionMeta.blurb;
-  const needsSessionPreview = activeSection === "projects-tasks" || activeSection === "overview";
-  const needsTaskEvidence = activeSection === "projects-tasks";
+  const needsSessionPreview =
+    activeSection === "projects-tasks" || activeSection === "overview" || activeSection === "collaboration";
+  const needsTaskEvidence = activeSection === "projects-tasks" || activeSection === "collaboration";
   const needsTeamSnapshot = activeSection === "team";
   const needsMemoryFiles = activeSection === "memory";
   const needsWorkspaceFiles = activeSection === "docs";
@@ -4185,6 +4600,7 @@ async function renderHtml(
   const needsSecuritySummary = activeSection === "settings";
   const needsUpdateSummary = activeSection === "settings";
   const needsMemoryState = activeSection === "memory";
+  const needsCollaborationThreads = activeSection === "collaboration";
   markRenderPhase("snapshot");
   const exceptions = commanderExceptions(snapshot);
   const exceptionsFeed = commanderExceptionsFeed(snapshot);
@@ -4211,17 +4627,32 @@ async function renderHtml(
         filters: {},
         items: [],
       };
+  const collaborationPreview =
+    needsCollaborationThreads
+      ? await loadCachedCollaborationPreview(snapshot, toolClient)
+      : {
+          generatedAt: snapshot.generatedAt,
+          total: 0,
+          page: 1,
+          pageSize: 0,
+          filters: {},
+          items: [],
+        };
   const sessionRows = renderSessionPreviewRows(sessionPreview.items, options.language);
   markRenderPhase("session-preview");
-  const [cronOverview, openclawCronJobs, replayPreview, usageCost, officeRoster, officePresence] = await Promise.all([
+  const [cronOverview, openclawCronJobs, replayPreview, usageCost, officeRoster, officePresence, avatarPreferences] = await Promise.all([
     buildCronOverview(snapshot, POLLING_INTERVALS_MS.cron),
     loadOpenclawCronCatalog(options.language),
     loadCachedReplayPreview(),
     loadCachedUsageCost(snapshot, usageCostMode),
     loadBestEffortAgentRoster(),
     loadCachedOfficeSessionPresence(),
+    loadAvatarPreferences(),
   ]);
   markRenderPhase("shared-data");
+  if (avatarPreferences.issues.length > 0) {
+    console.warn("[mission-control] avatar preferences normalized", { issues: avatarPreferences.issues });
+  }
   const [teamSnapshot, memoryFiles, memoryFacetOptions, workspaceFiles, workspaceFacetOptions, taskEvidenceItems, connectionHealthSummary, securitySummary, updateSummary, memoryStateSummary] = await Promise.all([
     needsTeamSnapshot
       ? loadTeamSnapshot(officeRoster)
@@ -4276,6 +4707,35 @@ async function renderHtml(
     sessionItems: taskSignalItems,
     language: options.language,
   });
+  const collaborationSessionKeys = needsCollaborationThreads
+    ? [...new Set(
+        taskExecutionChainCards
+          .flatMap((item) => [item.sessionKey, item.executionChain.parentSessionKey, item.executionChain.childSessionKey])
+          .map((value) => value?.trim() ?? "")
+          .filter(Boolean),
+      )]
+    : [];
+  const collaborationEvidenceItems =
+    needsCollaborationThreads && collaborationSessionKeys.length > 0
+      ? await loadCachedTaskEvidenceSessions(snapshot, toolClient, collaborationSessionKeys, 40)
+      : [];
+  const collaborationSignalItems = mergeSessionConversationItems(
+    collaborationEvidenceItems,
+    mergeSessionConversationItems(taskSignalItems, collaborationPreview.items),
+  );
+  const collaborationThreadCards = needsCollaborationThreads
+    ? mergeCollaborationThreadCards(
+        buildCollaborationThreadCards({
+          cards: taskExecutionChainCards,
+          sessionItems: collaborationSignalItems,
+          language: options.language,
+        }),
+        buildInterSessionCollaborationCards({
+          sessionItems: collaborationSignalItems,
+          language: options.language,
+        }),
+      )
+    : [];
   const taskCertaintyCards = buildTaskCertaintyCards({
     tasks,
     sessions: snapshot.sessions,
@@ -4290,6 +4750,25 @@ async function renderHtml(
   const runningExecutionChainCount = taskExecutionChainCards.filter((item) => item.executionChain.stage === "running").length;
   const mappedExecutionChainCount = taskExecutionChainCards.filter((item) => !item.unmapped).length;
   const taskExecutionChainHtml = renderTaskExecutionChainCards(taskExecutionChainCards, options.language);
+  const collaborationThreadHtml = renderCollaborationThreadCards(collaborationThreadCards, options.language);
+  const collaborationThreadVisibleCount = collaborationThreadCards.length;
+  const collaborationThreadTotalCount = collaborationThreadCards.reduce((sum, item) => sum + item.aggregateCount, 0);
+  const collaborationActiveCount = collaborationThreadCards.reduce(
+    (sum, item) => sum + (item.status === "active" ? item.aggregateCount : 0),
+    0,
+  );
+  const collaborationHandoffCount = collaborationThreadCards.reduce(
+    (sum, item) => sum + (item.status === "handoff" ? item.aggregateCount : 0),
+    0,
+  );
+  const collaborationBlockedCount = collaborationThreadCards.reduce(
+    (sum, item) => sum + (item.status === "blocked" ? item.aggregateCount : 0),
+    0,
+  );
+  const collaborationCompletedTodayCount = collaborationThreadCards.reduce((sum, item) => {
+    if (item.status !== "completed") return sum;
+    return sum + item.aggregateItems.filter((entry) => isSameLocalCalendarDay(entry.latestAt, Date.now())).length;
+  }, 0);
   const taskRoleSummaries = buildTaskRoleSummaries(controlCenterMappingTasks);
   const pendingApprovalsCount = allApprovals.filter((item) => item.status === "pending").length;
   const inProgressTasksCount = realTasks.filter((task) => task.status === "in_progress").length;
@@ -4750,7 +5229,7 @@ async function renderHtml(
         language: options.language,
       })
     : [];
-  const staffOverviewCardsHtml = renderStaffOverviewCards(staffOverviewCards, options.language);
+  const staffOverviewCardsHtml = renderStaffOverviewCards(staffOverviewCards, avatarPreferences.preferences, options.language);
   const subscriptionStatusHtml = renderSubscriptionStatusCard(usageCost.subscription, options.language);
   const sectionNav = sectionLinks.map((item) => {
     const href = buildHomeHref(filters, options.compactStatusStrip, item.key, options.language, options.usageView);
@@ -5482,6 +5961,66 @@ async function renderHtml(
       </div>
     </details>
   `;
+  const collaborationSection = `
+    <section class="card" id="collaboration-hub">
+      <div class="overview-command-head">
+        <div>
+          <h2>${escapeHtml(t("Team collaboration", "团队协作"))}</h2>
+          <div class="meta">${escapeHtml(t("See both collaboration patterns in one place: parent-child relays and cross-session messages between existing agent sessions.", "把两种协作都放在同一页看清楚：父子会话接力，以及不同智能体既有会话之间的消息往返。"))}</div>
+        </div>
+        <div>${badge(collaborationBlockedCount > 0 ? "warn" : collaborationActiveCount > 0 ? "info" : "ok", collaborationBlockedCount > 0 ? t("Needs follow-up", "需跟进") : collaborationActiveCount > 0 ? t("Active", "进行中") : t("Steady", "平稳"))}</div>
+      </div>
+      <div class="status-strip collaboration-summary-grid">
+        <div class="status-chip">
+          <span>${escapeHtml(t("Active", "活跃协作"))}</span>
+          <strong>${collaborationActiveCount}</strong>
+        </div>
+        <div class="status-chip">
+          <span>${escapeHtml(t("Waiting handoff", "等待交接"))}</span>
+          <strong>${collaborationHandoffCount}</strong>
+        </div>
+        <div class="status-chip">
+          <span>${escapeHtml(t("Blocked", "卡住"))}</span>
+          <strong>${collaborationBlockedCount}</strong>
+        </div>
+        <div class="status-chip">
+          <span>${escapeHtml(t("Completed today", "今日完成"))}</span>
+          <strong>${collaborationCompletedTodayCount}</strong>
+        </div>
+      </div>
+      <div class="meta collaboration-headline">${escapeHtml(
+        collaborationThreadVisibleCount > 0
+          ? collaborationThreadTotalCount > collaborationThreadVisibleCount
+            ? t(
+                `${collaborationThreadTotalCount} collaboration threads are visible in total. Similar completed threads are folded into ${collaborationThreadVisibleCount} cards so this page stays readable.`,
+                `当前共整理出 ${collaborationThreadTotalCount} 条协作线程，并把相近的已完成线程折叠为 ${collaborationThreadVisibleCount} 张卡片，方便直接看重点。`,
+              )
+            : t(
+                `${collaborationThreadVisibleCount} visible collaboration threads. Open a thread to inspect parent-child relays or cross-session messages without leaving this page.`,
+                `当前可见 ${collaborationThreadVisibleCount} 条协作线程。直接展开线程，就能在当前页查看父子接力或跨会话消息时间线。`,
+              )
+          : t(
+              "No visible collaboration threads yet. They will appear once parent-child relays or cross-session messages become visible.",
+              "当前还没有可见的协作线程。父子接力或跨会话通信出现后，这里就会开始显示。",
+            ),
+      )}</div>
+    </section>
+    <section class="card" id="collaboration-board" data-collab-root>
+      <div class="overview-command-head">
+        <h2>${escapeHtml(t("Collaboration threads", "协作线程"))}</h2>
+        <div class="meta" data-collab-filter-state>${escapeHtml(t("Showing all visible threads", "当前显示全部可见线程"))}</div>
+      </div>
+      <div class="segment-switch collaboration-filter-bar" role="tablist" aria-label="${escapeHtml(t("Collaboration filters", "协作筛选"))}">
+        <button class="segment-item active" type="button" data-collab-filter="all">${escapeHtml(t("All", "全部"))}</button>
+        <button class="segment-item" type="button" data-collab-filter="active">${escapeHtml(t("In progress", "进行中"))}</button>
+        <button class="segment-item" type="button" data-collab-filter="blocked">${escapeHtml(t("Blocked", "卡住"))}</button>
+        <button class="segment-item" type="button" data-collab-filter="completed">${escapeHtml(t("Completed", "已完成"))}</button>
+        <button class="segment-item" type="button" data-collab-filter="multi-agent">${escapeHtml(t("Multi-agent only", "只看多智能体"))}</button>
+        <button class="segment-item" type="button" data-collab-filter="main-dispatched">${escapeHtml(t("Main dispatched", "只看 Main 派发"))}</button>
+      </div>
+      ${collaborationThreadHtml}
+    </section>
+  `;
   const memoryMainCount = memoryFiles.filter((entry) => entry.facetKey === "main").length;
   const memoryWorkbench = needsMemoryFiles
     ? await renderEditableFileWorkbench({
@@ -5882,6 +6421,7 @@ async function renderHtml(
   let sectionBody = overviewSection;
   if (options.section === "calendar") sectionBody = projectsSection;
   if (options.section === "team") sectionBody = teamUnifiedSection;
+  if (options.section === "collaboration") sectionBody = collaborationSection;
   if (options.section === "memory") sectionBody = memorySection;
   if (options.section === "docs") sectionBody = docsSection;
   if (options.section === "usage-cost") sectionBody = usageSection;
@@ -5923,7 +6463,10 @@ async function renderHtml(
   const fileWorkbenchScript = renderFileWorkbenchScript();
   const agentVisualEnhancerScript = renderAgentVisualEnhancerScript();
   const nativeMotionScript = renderNativeMotionScript(options.language);
+  const collaborationFilterScript = renderCollaborationFilterScript(options.language);
   const quotaResetScript = renderQuotaResetScript();
+  const headerControlsScript = renderHeaderControlsScript(options.language);
+  const avatarEditorScript = renderAvatarEditorScript(options.language, IMPORT_MUTATION_ENABLED);
   const renderTotalMs = Math.round(performance.now() - renderStartedAt);
   if (renderTotalMs >= 1000) {
     console.warn("[mission-control] slow html render", {
@@ -5938,6 +6481,105 @@ async function renderHtml(
 <head>
   <meta charset="utf-8" />
   <title>OpenClaw Control Center</title>
+  <script>
+    (() => {
+      const key = 'openclaw:theme';
+      const stored = (() => { try { return window.localStorage.getItem(key) || ''; } catch { return ''; } })();
+      const prefersDark = (() => { try { return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches; } catch { return false; } })();
+      const theme = (stored === 'dark' || stored === 'light') ? stored : (prefersDark ? 'dark' : 'light');
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
+  <script>
+    (() => {
+      const restoreKey = 'openclaw:refresh-state:v1:' + location.pathname + location.search;
+
+      const captureState = () => {
+        const inputs = Array.from(document.querySelectorAll('input, textarea, select'));
+        const items = inputs.map((node) => {
+          const el = node;
+          const name = el.getAttribute('name') || '';
+          const id = el.getAttribute('id') || '';
+          const key = id ? ('#' + id) : (name ? (el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]') : '');
+          if (!key) return null;
+          const type = (el instanceof HTMLInputElement ? (el.type || '').toLowerCase() : '');
+          if (el instanceof HTMLInputElement && (type === 'checkbox' || type === 'radio')) {
+            return { key, kind: 'checked', value: Boolean(el.checked) };
+          }
+          const value = (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) ? el.value : '';
+          const selectionStart = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionStart : null;
+          const selectionEnd = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionEnd : null;
+          return { key, kind: 'value', value, selectionStart, selectionEnd };
+        }).filter(Boolean);
+
+        const focused = document.activeElement;
+        const focusedKey = (focused && focused instanceof HTMLElement)
+          ? (focused.id ? ('#' + focused.id) : (focused.getAttribute('name') ? (focused.tagName.toLowerCase() + '[name="' + focused.getAttribute('name').replace(/"/g, '\\"') + '"]') : ''))
+          : '';
+
+        return {
+          at: Date.now(),
+          scrollY: window.scrollY || 0,
+          focusedKey,
+          items,
+        };
+      };
+
+      const restoreState = (state) => {
+        if (!state || typeof state !== 'object') return;
+        const items = Array.isArray(state.items) ? state.items : [];
+        items.forEach((item) => {
+          if (!item || typeof item !== 'object') return;
+          const key = String(item.key || '');
+          if (!key) return;
+          const el = document.querySelector(key);
+          if (!el) return;
+          const kind = String(item.kind || '');
+          if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio') && kind === 'checked') {
+            el.checked = Boolean(item.value);
+            return;
+          }
+          if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) && kind === 'value') {
+            el.value = String(item.value ?? '');
+            if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+              const ss = Number(item.selectionStart);
+              const se = Number(item.selectionEnd);
+              if (Number.isFinite(ss) && Number.isFinite(se)) {
+                try { el.setSelectionRange(ss, se); } catch {}
+              }
+            }
+          }
+        });
+
+        if (Number.isFinite(Number(state.scrollY))) {
+          window.scrollTo({ top: Number(state.scrollY), left: 0, behavior: 'instant' });
+        }
+        if (state.focusedKey && typeof state.focusedKey === 'string') {
+          const target = document.querySelector(state.focusedKey);
+          if (target && target instanceof HTMLElement) {
+            try { target.focus(); } catch {}
+          }
+        }
+      };
+
+      const boot = () => {
+        let raw = '';
+        try { raw = window.sessionStorage.getItem(restoreKey) || ''; } catch {}
+        if (!raw) return;
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch { parsed = null; }
+        try { window.sessionStorage.removeItem(restoreKey); } catch {}
+        if (!parsed) return;
+        window.requestAnimationFrame(() => restoreState(parsed));
+      };
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot, { once: true });
+      } else {
+        boot();
+      }
+    })();
+  </script>
   <style>
     :root {
       --bg: #eef2f6;
@@ -5990,6 +6632,56 @@ async function renderHtml(
       --space-2: 16px;
       --space-3: 24px;
       --space-4: 32px;
+      --page-bg:
+        radial-gradient(circle at 8% -10%, rgba(164, 192, 230, 0.22), transparent 34%),
+        radial-gradient(circle at 96% 0%, rgba(218, 226, 240, 0.18), transparent 32%),
+        linear-gradient(180deg, #f3f5f8 0%, #e9edf3 46%, #e5eaf0 100%);
+      --page-glow:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.16) 42%, transparent 60%),
+        radial-gradient(circle at 50% -18%, rgba(255, 255, 255, 0.54), transparent 46%);
+    }
+    html[data-theme="dark"] {
+      --bg: #131820;
+      --panel: rgba(45, 53, 66, 0.34);
+      --panel-soft: rgba(34, 41, 52, 0.3);
+      --surface-1: rgba(61, 70, 85, 0.84);
+      --surface-2: rgba(51, 60, 74, 0.8);
+      --surface-3: rgba(42, 50, 63, 0.78);
+      --glass-1: rgba(39, 46, 58, 0.64);
+      --glass-2: rgba(29, 35, 45, 0.58);
+      --border: rgba(231, 237, 246, 0.12);
+      --border-soft: rgba(231, 237, 246, 0.07);
+      --border-strong: rgba(243, 247, 252, 0.19);
+      --text: rgba(247, 250, 252, 0.96);
+      --muted: rgba(193, 201, 214, 0.78);
+      --todo: rgba(193, 201, 214, 0.58);
+      --card-fill:
+        linear-gradient(180deg, rgba(74, 85, 103, 0.62), rgba(57, 66, 81, 0.6) 58%, rgba(43, 51, 63, 0.62)),
+        radial-gradient(circle at 100% 0%, rgba(216, 231, 252, 0.09), transparent 62%);
+      --card-fill-soft:
+        linear-gradient(180deg, rgba(63, 73, 88, 0.54), rgba(48, 57, 70, 0.52) 58%, rgba(38, 45, 56, 0.54)),
+        radial-gradient(circle at 100% 0%, rgba(216, 231, 252, 0.07), transparent 62%);
+      --card-border: rgba(231, 237, 246, 0.11);
+      --card-border-strong: rgba(243, 247, 252, 0.17);
+      --shadow-soft: 0 18px 40px rgba(1, 4, 9, 0.18);
+      --shadow-hard: 0 34px 80px rgba(1, 4, 9, 0.24);
+      --shadow-float: 0 26px 66px rgba(1, 4, 9, 0.2);
+      --shadow-press: 0 12px 26px rgba(1, 4, 9, 0.16);
+      --card-shadow-soft: 0 18px 36px rgba(1, 4, 9, 0.14), 0 6px 14px rgba(1, 4, 9, 0.08);
+      --card-shadow: 0 22px 46px rgba(1, 4, 9, 0.16), 0 8px 18px rgba(1, 4, 9, 0.08);
+      --card-shadow-hover: 0 28px 56px rgba(1, 4, 9, 0.2), 0 10px 22px rgba(1, 4, 9, 0.1);
+      --ring-soft: 0 0 0 4px rgba(195, 214, 239, 0.1);
+      --focus: #dbe8fb;
+      --progress: #a8cbff;
+      --page-bg:
+        radial-gradient(circle at 10% -10%, rgba(146, 171, 212, 0.16), transparent 30%),
+        radial-gradient(circle at 86% 0%, rgba(109, 128, 165, 0.18), transparent 34%),
+        radial-gradient(circle at 50% 100%, rgba(89, 107, 136, 0.11), transparent 38%),
+        linear-gradient(180deg, #1a212b 0%, #131a24 46%, #0f151d 100%);
+      --page-glow:
+        radial-gradient(circle at 46% -16%, rgba(232, 241, 255, 0.065), transparent 44%),
+        radial-gradient(circle at 52% 28%, rgba(182, 202, 233, 0.035), transparent 28%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.014), transparent 36%);
     }
     * { box-sizing: border-box; }
     body {
@@ -5999,10 +6691,7 @@ async function renderHtml(
       line-height: 1.58;
       margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(circle at 8% -10%, rgba(164, 192, 230, 0.22), transparent 34%),
-        radial-gradient(circle at 96% 0%, rgba(218, 226, 240, 0.18), transparent 32%),
-        linear-gradient(180deg, #f3f5f8 0%, #e9edf3 46%, #e5eaf0 100%);
+      background: var(--page-bg);
       position: relative;
       text-rendering: optimizeLegibility;
       -webkit-font-smoothing: antialiased;
@@ -6014,9 +6703,17 @@ async function renderHtml(
       content: "";
       position: fixed;
       inset: 0;
+      background: var(--page-glow);
+      pointer-events: none;
+      z-index: -1;
+    }
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
       background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.16) 42%, transparent 60%),
-        radial-gradient(circle at 50% -18%, rgba(255, 255, 255, 0.54), transparent 46%);
+        radial-gradient(circle at 18% 18%, rgba(255, 255, 255, 0.028), transparent 20%),
+        radial-gradient(circle at 82% 12%, rgba(255, 255, 255, 0.024), transparent 18%);
       pointer-events: none;
       z-index: -1;
     }
@@ -6078,6 +6775,21 @@ async function renderHtml(
         radial-gradient(circle at 82% 14%, rgba(255, 255, 255, 0.8), transparent 56%);
       box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
     }
+    html[data-theme="dark"] .brand {
+      border: 1px solid rgba(191, 203, 221, 0.12);
+      background:
+        linear-gradient(135deg, rgba(47, 56, 69, 0.82), rgba(28, 35, 45, 0.86)),
+        radial-gradient(circle at 82% 14%, rgba(214, 229, 252, 0.08), transparent 58%);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.055),
+        0 16px 34px rgba(1, 4, 9, 0.18);
+    }
+    .brand-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
     .brand-kicker {
       display: inline-flex;
       align-items: center;
@@ -6092,6 +6804,46 @@ async function renderHtml(
       background: rgba(255, 255, 255, 0.84);
       text-transform: uppercase;
     }
+    html[data-theme="dark"] .brand-kicker {
+      border: 1px solid rgba(124, 188, 255, 0.2);
+      color: rgba(223, 236, 252, 0.94);
+      background:
+        linear-gradient(180deg, rgba(22, 27, 35, 0.88), rgba(14, 18, 24, 0.86));
+    }
+    .brand-actions {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .icon-btn {
+      width: 30px;
+      height: 30px;
+      border-radius: 10px;
+      border: 1px solid var(--border-soft);
+      background: rgba(255, 255, 255, 0.62);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease, border-color 140ms ease;
+      box-shadow: 0 10px 20px rgba(15, 23, 42, 0.06);
+      color: var(--text);
+    }
+    html[data-theme="dark"] .icon-btn {
+      background:
+        linear-gradient(180deg, rgba(48, 57, 70, 0.74), rgba(31, 38, 48, 0.76)),
+        radial-gradient(circle at 50% 0%, rgba(214, 229, 252, 0.03), transparent 62%);
+      border-color: rgba(191, 203, 221, 0.14);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.045),
+        0 10px 22px rgba(1, 4, 9, 0.16);
+    }
+    .icon-btn:hover { transform: translateY(-1px); box-shadow: 0 14px 28px rgba(15, 23, 42, 0.1); border-color: var(--border); }
+    .icon-btn:active { transform: translateY(0); box-shadow: var(--shadow-press); }
+    .icon-btn:focus-visible { outline: none; box-shadow: var(--ring-soft); }
+    .icon-btn[aria-busy="true"] { cursor: progress; opacity: 0.86; }
+    .icon-btn svg { width: 16px; height: 16px; }
     .brand h1 { font-size: 23px; font-weight: 760; margin-top: 9px; }
     .brand .meta { margin-top: 6px; }
     .meta { color: var(--muted); font-size: 13px; line-height: 1.62; }
@@ -7044,6 +7796,230 @@ async function renderHtml(
       overflow-wrap: anywhere;
       word-break: break-word;
     }
+    .collaboration-summary-grid {
+      margin-top: 12px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    .collaboration-headline {
+      margin-top: 10px;
+    }
+    .collaboration-filter-bar {
+      margin-top: 12px;
+      width: 100%;
+      justify-content: flex-start;
+    }
+    .collaboration-thread-list {
+      margin-top: 14px;
+      display: grid;
+      gap: 14px;
+    }
+    .collaboration-thread-card {
+      padding: 0;
+      overflow: hidden;
+    }
+    .collaboration-thread-card > summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .collaboration-thread-card > summary::-webkit-details-marker {
+      display: none;
+    }
+    .collaboration-thread-card > summary::marker {
+      display: none;
+    }
+    .collaboration-thread-head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+    }
+    .collaboration-route-avatars {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: nowrap;
+    }
+    .collaboration-participant {
+      display: grid;
+      justify-items: center;
+      gap: 6px;
+      min-width: 72px;
+      flex: 0 0 auto;
+    }
+    .collaboration-participant-label {
+      font-size: 11px;
+      line-height: 1.35;
+      color: #6e7680;
+      font-weight: 620;
+      letter-spacing: 0.01em;
+      text-align: center;
+    }
+    .collaboration-route-arrow {
+      color: #6e7680;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .collaboration-avatar {
+      max-width: 72px;
+      width: 72px;
+      padding: 6px;
+      border-radius: 16px;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.84),
+        0 10px 22px rgba(17, 24, 39, 0.06);
+    }
+    .collaboration-avatar .agent-stage {
+      aspect-ratio: 1 / 1;
+      border-radius: 10px;
+    }
+    .collaboration-avatar .agent-animal-label {
+      display: none;
+    }
+    .collaboration-avatar.is-current {
+      border-color: rgba(0, 113, 227, 0.22);
+      box-shadow:
+        inset 0 0 0 1px rgba(0, 113, 227, 0.1),
+        0 12px 26px rgba(0, 113, 227, 0.12);
+      background:
+        linear-gradient(180deg, rgba(240, 247, 255, 0.99), rgba(255, 255, 255, 0.98)),
+        radial-gradient(circle at 50% 0%, rgba(0, 113, 227, 0.08), transparent 60%);
+    }
+    .collaboration-thread-copy {
+      min-width: 0;
+      display: grid;
+      gap: 5px;
+    }
+    .collaboration-thread-copy strong {
+      font-size: 24px;
+      line-height: 1.08;
+      letter-spacing: -0.035em;
+      color: #1d1d1f;
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      overflow: hidden;
+      overflow-wrap: anywhere;
+    }
+    .collaboration-thread-badges {
+      display: grid;
+      justify-items: end;
+      gap: 8px;
+    }
+    .collaboration-current-owner {
+      font-size: 12px;
+      line-height: 1.45;
+      color: #5f6670;
+      font-weight: 620;
+      text-align: right;
+    }
+    .collaboration-thread-teaser {
+      display: grid;
+      gap: 8px;
+    }
+    .collaboration-latest-snippet {
+      border: 1px solid rgba(0, 113, 227, 0.12);
+      border-radius: 16px;
+      padding: 12px 14px;
+      background:
+        linear-gradient(180deg, rgba(246, 250, 255, 0.98), rgba(255, 255, 255, 0.98)),
+        radial-gradient(circle at 0% 0%, rgba(0, 113, 227, 0.06), transparent 52%);
+      color: #294866;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .collaboration-thread-body {
+      border-top: 1px solid rgba(17, 24, 39, 0.07);
+      padding: 0 18px 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .collaboration-timeline {
+      list-style: none;
+      margin: 0;
+      padding: 14px 0 0;
+      display: grid;
+      gap: 12px;
+    }
+    .collaboration-timeline-step {
+      display: grid;
+      grid-template-columns: 176px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      padding-top: 12px;
+      border-top: 1px solid rgba(17, 24, 39, 0.06);
+    }
+    .collaboration-timeline-step:first-child {
+      border-top: none;
+      padding-top: 0;
+    }
+    .collaboration-agent-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(17, 24, 39, 0.09);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(248, 251, 255, 0.96)),
+        radial-gradient(circle at 0% 0%, color-mix(in srgb, var(--agent-accent) 14%, transparent), transparent 58%);
+      color: #223546;
+      font-size: 13px;
+      font-weight: 650;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.86);
+    }
+    .collaboration-agent-pill-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--agent-accent);
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.72);
+      flex: 0 0 auto;
+    }
+    .collaboration-step-copy {
+      min-width: 0;
+      display: grid;
+      gap: 6px;
+    }
+    .collaboration-step-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .collaboration-step-head strong {
+      font-size: 15px;
+      color: #1d1d1f;
+      letter-spacing: -0.01em;
+    }
+    .collaboration-step-head span {
+      font-size: 12px;
+      color: #6e7680;
+    }
+    .collaboration-thread-foot {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .collaboration-folded-note {
+      margin-top: 2px;
+    }
+    .collaboration-folded-list {
+      margin: 8px 0 0;
+    }
+    .collaboration-thread-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .collaboration-technical-details {
+      margin-top: -4px;
+    }
     .timeline-summary-strip {
       margin-top: 10px;
       display: grid;
@@ -7374,11 +8350,675 @@ async function renderHtml(
       box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, 0.8),
         0 10px 20px rgba(17, 24, 39, 0.05);
+      position: relative;
     }
     .staff-avatar .agent-stage {
       aspect-ratio: 1 / 1;
       border-radius: 12px;
+      overflow: hidden;
+      display: grid;
+      place-items: center;
     }
+    .agent-avatar-img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: inherit;
+      display: block;
+    }
+    .avatar-edit-btn {
+      position: absolute;
+      top: 9px;
+      right: 9px;
+      width: 32px;
+      height: 32px;
+      border-radius: 12px;
+      border: 1px solid rgba(17, 24, 39, 0.12);
+      background: rgba(255, 255, 255, 0.72);
+      box-shadow: 0 10px 20px rgba(17, 24, 39, 0.09);
+      color: rgba(29, 29, 31, 0.92);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transform: translateY(-2px);
+      pointer-events: none;
+      transition: opacity 140ms ease, transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+    .staff-avatar:hover .avatar-edit-btn,
+    .agent-avatar:hover .avatar-edit-btn {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .avatar-edit-btn:focus-visible {
+      outline: none;
+      box-shadow: var(--ring-soft);
+      opacity: 1;
+      pointer-events: auto;
+    }
+    html[data-theme="dark"] .avatar-edit-btn {
+      border-color: rgba(226, 232, 240, 0.18);
+      background: rgba(12, 18, 29, 0.72);
+      color: rgba(241, 245, 249, 0.92);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.46);
+    }
+    .avatar-edit-btn svg { width: 16px; height: 16px; }
+    .avatar-edit-btn,
+    .avatar-edit-btn svg,
+    .avatar-edit-btn path { pointer-events: auto; }
+    .avatar-edit-btn svg,
+    .avatar-edit-btn path { pointer-events: none; }
+    .avatar-edit-btn { z-index: 2; }
+    .avatar-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 1200;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: rgba(10, 15, 24, 0.38);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+    }
+    html[data-theme="dark"] .avatar-modal-backdrop { background: rgba(0, 0, 0, 0.52); }
+    .avatar-modal {
+      width: min(920px, 100%);
+      border-radius: 22px;
+      border: 1px solid var(--card-border);
+      background: var(--card-fill);
+      box-shadow: var(--shadow-hard);
+      overflow: hidden;
+    }
+    .avatar-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border-soft);
+      background: linear-gradient(180deg, var(--surface-1), var(--surface-2));
+    }
+    .avatar-modal-title { font-weight: 720; letter-spacing: -0.02em; }
+    .avatar-modal-actions { display: inline-flex; gap: 8px; align-items: center; }
+    .avatar-sync-btn { height: 34px; padding: 0 12px; border-radius: 12px; }
+    .avatar-modal-close {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+      border: 1px solid var(--border-soft);
+      background: transparent;
+      cursor: pointer;
+      color: var(--text);
+    }
+    .avatar-modal-close:hover { background: rgba(255, 255, 255, 0.42); }
+    html[data-theme="dark"] .avatar-modal-close:hover { background: rgba(255, 255, 255, 0.06); }
+    .avatar-modal-body { padding: 16px; display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 14px; }
+    .avatar-preview {
+      border: 1px solid var(--border-soft);
+      border-radius: 18px;
+      padding: 12px;
+      background: linear-gradient(180deg, var(--surface-1), var(--surface-2));
+      box-shadow: var(--shadow-soft);
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+    .avatar-preview .agent-stage { width: 100%; aspect-ratio: 1 / 1; border-radius: 14px; overflow: hidden; }
+    .avatar-tabs { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+    .avatar-tab {
+      border: 1px solid var(--border-soft);
+      background: rgba(255, 255, 255, 0.62);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    html[data-theme="dark"] .avatar-tab { background: rgba(12, 18, 29, 0.62); }
+    .avatar-tab.active { border-color: rgba(0, 113, 227, 0.42); box-shadow: var(--ring-soft); }
+    .avatar-panel { display: grid; gap: 12px; align-content: start; }
+    .avatar-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    @media (max-width: 740px) {
+      .avatar-modal-body { grid-template-columns: 1fr; }
+      .avatar-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    .avatar-choice {
+      border: 1px solid var(--border-soft);
+      background: linear-gradient(180deg, var(--surface-1), var(--surface-2));
+      border-radius: 16px;
+      padding: 10px;
+      cursor: pointer;
+      box-shadow: var(--shadow-soft);
+      transition: transform 140ms ease, box-shadow 160ms ease, border-color 160ms ease;
+      display: grid;
+      gap: 8px;
+      place-items: center;
+    }
+    .avatar-choice:hover { transform: translateY(-1px); box-shadow: var(--shadow-float); border-color: var(--border); }
+    .avatar-choice:focus-visible { outline: none; box-shadow: var(--ring-soft); }
+    .avatar-choice .avatar-choice-label { font-size: 12px; color: var(--muted); text-align: center; }
+    .avatar-upload-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .avatar-upload-btn { padding: 10px 14px; border-radius: 14px; }
+    .avatar-upload-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    @media (max-width: 740px) { .avatar-upload-list { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    .avatar-upload-item { position: relative; border-radius: 16px; overflow: hidden; border: 1px solid var(--border-soft); background: var(--surface-2); }
+    .avatar-upload-item img { width: 100%; height: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block; }
+    .avatar-upload-actions { position: absolute; inset: auto 8px 8px 8px; display: flex; gap: 8px; }
+    .avatar-mini-btn {
+      flex: 1;
+      border-radius: 12px;
+      border: 1px solid rgba(0,0,0,0.08);
+      background: rgba(255,255,255,0.86);
+      padding: 7px 10px;
+      cursor: pointer;
+      font-weight: 650;
+      font-size: 12px;
+    }
+    html[data-theme="dark"] .avatar-mini-btn { border-color: rgba(226,232,240,0.14); background: rgba(12,18,29,0.72); color: var(--text); }
+    .avatar-crop-shell { display: grid; gap: 12px; }
+    .avatar-crop-canvas { width: 100%; max-width: 420px; border-radius: 18px; border: 1px solid var(--border-soft); background: rgba(0,0,0,0.1); }
+    .avatar-crop-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .avatar-token-row { margin-top: 6px; display: grid; gap: 6px; }
+    html[data-theme="dark"] a { color: var(--focus); }
+    html[data-theme="dark"] .nav-link span,
+    html[data-theme="dark"] .section-title,
+    html[data-theme="dark"] .overview-pulse-card .status-chip strong,
+    html[data-theme="dark"] .card h2 { color: var(--text); }
+    html[data-theme="dark"] .meta,
+    html[data-theme="dark"] .section-blurb,
+    html[data-theme="dark"] .staff-role,
+    html[data-theme="dark"] .overview-busy-copy,
+    html[data-theme="dark"] .overview-pulse-card .status-chip span,
+    html[data-theme="dark"] .overview-kpi-detail,
+    html[data-theme="dark"] .overview-kpi-label,
+    html[data-theme="dark"] .overview-kpi-value,
+    html[data-theme="dark"] .overview-primary-card .overview-primary-value,
+    html[data-theme="dark"] .overview-primary-card .overview-primary-label { color: var(--muted); }
+    html[data-theme="dark"] .panel,
+    html[data-theme="dark"] .sidebar { border-color: var(--border); }
+    html[data-theme="dark"] .sidebar {
+      background:
+        linear-gradient(180deg, rgba(56, 66, 81, 0.44), rgba(36, 43, 54, 0.42)),
+        radial-gradient(circle at 100% 0%, rgba(232, 241, 255, 0.08), transparent 50%);
+      box-shadow:
+        0 22px 54px rgba(1, 4, 9, 0.1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.075);
+      backdrop-filter: blur(36px) saturate(128%);
+      -webkit-backdrop-filter: blur(36px) saturate(128%);
+    }
+    html[data-theme="dark"] .nav-link {
+      background:
+        linear-gradient(180deg, rgba(62, 73, 89, 0.28), rgba(40, 47, 59, 0.28)),
+        radial-gradient(circle at 0% 0%, rgba(255, 255, 255, 0.014), transparent 54%);
+      border-color: rgba(223, 231, 242, 0.065);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.025),
+        0 10px 22px rgba(1, 4, 9, 0.05);
+      backdrop-filter: blur(18px) saturate(124%);
+      -webkit-backdrop-filter: blur(18px) saturate(124%);
+    }
+    html[data-theme="dark"] .nav-link.active {
+      background:
+        linear-gradient(180deg, rgba(108, 120, 141, 0.34), rgba(63, 74, 90, 0.36)),
+        radial-gradient(circle at 0% 0%, rgba(232, 241, 255, 0.11), transparent 44%);
+      border-color: rgba(236, 242, 250, 0.18);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.1),
+        0 18px 36px rgba(1, 4, 9, 0.08);
+    }
+    html[data-theme="dark"] .nav-link:hover {
+      background:
+        linear-gradient(180deg, rgba(74, 86, 104, 0.3), rgba(48, 56, 69, 0.3)),
+        radial-gradient(circle at 0% 0%, rgba(225, 236, 255, 0.04), transparent 42%);
+      border-color: rgba(223, 231, 242, 0.085);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.03),
+        0 14px 30px rgba(1, 4, 9, 0.06);
+    }
+    html[data-theme="dark"] .quick-chip,
+    html[data-theme="dark"] .segment-switch,
+    html[data-theme="dark"] .segment-item,
+    html[data-theme="dark"] .badge,
+    html[data-theme="dark"] .btn,
+    html[data-theme="dark"] .panel-toggle {
+      background:
+        linear-gradient(180deg, rgba(71, 82, 98, 0.34), rgba(44, 52, 64, 0.34)),
+        radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.02), transparent 62%);
+      color: rgba(243, 246, 250, 0.94);
+      border-color: rgba(223, 231, 242, 0.095);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 10px 22px rgba(1, 4, 9, 0.06);
+      backdrop-filter: blur(16px) saturate(122%);
+      -webkit-backdrop-filter: blur(16px) saturate(122%);
+    }
+    html[data-theme="dark"] .segment-item.active,
+    html[data-theme="dark"] .quick-chip.active {
+      border-color: rgba(223, 231, 242, 0.13);
+      color: rgba(247, 249, 252, 0.96);
+      background:
+        linear-gradient(180deg, rgba(110, 123, 144, 0.28), rgba(61, 71, 86, 0.32)),
+        radial-gradient(circle at 50% 0%, rgba(225, 236, 255, 0.06), transparent 60%);
+    }
+    html[data-theme="dark"] .btn:hover,
+    html[data-theme="dark"] .panel-toggle:hover,
+    html[data-theme="dark"] .icon-btn:hover {
+      border-color: rgba(223, 231, 242, 0.13);
+      color: rgba(247, 249, 252, 0.96);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.045),
+        0 14px 28px rgba(1, 4, 9, 0.06);
+    }
+    html[data-theme="dark"] .overview-usage-card,
+    html[data-theme="dark"] .overview-pulse-card,
+    html[data-theme="dark"] .overview-kpi-card,
+    html[data-theme="dark"] .overview-primary-card,
+    html[data-theme="dark"] .summary-gauge-card {
+      background: var(--card-fill-soft);
+      box-shadow:
+        0 18px 34px rgba(1, 4, 9, 0.11),
+        inset 0 1px 0 rgba(255, 255, 255, 0.065);
+      backdrop-filter: blur(24px) saturate(126%);
+      -webkit-backdrop-filter: blur(24px) saturate(126%);
+    }
+    html[data-theme="dark"] .overview-pulse-card .status-chip,
+    html[data-theme="dark"] .summary-gauge-card {
+      background:
+        linear-gradient(180deg, rgba(46, 54, 66, 0.62), rgba(34, 40, 49, 0.62)),
+        radial-gradient(circle at 100% 0%, rgba(225, 236, 255, 0.04), transparent 58%);
+      border-color: rgba(223, 231, 242, 0.075);
+    }
+    html[data-theme="dark"] .summary-track {
+      background: rgba(120, 136, 160, 0.18);
+      border-color: rgba(217, 227, 242, 0.08);
+    }
+    html[data-theme="dark"] .summary-fill {
+      background: linear-gradient(90deg, rgba(64, 187, 119, 0.9), rgba(88, 205, 137, 0.95));
+    }
+    html[data-theme="dark"] .summary-fill.warn {
+      background: linear-gradient(90deg, rgba(205, 151, 41, 0.88), rgba(223, 177, 77, 0.94));
+    }
+    html[data-theme="dark"] .section-blurb,
+    html[data-theme="dark"] .exec-title,
+    html[data-theme="dark"] .overview-kpi-detail,
+    html[data-theme="dark"] .overview-task-metric,
+    html[data-theme="dark"] .meta,
+    html[data-theme="dark"] .meta-inline {
+      color: var(--muted);
+    }
+    html[data-theme="dark"] .nav-link span,
+    html[data-theme="dark"] .card h2,
+    html[data-theme="dark"] .exec-metric,
+    html[data-theme="dark"] .overview-hero-card .value,
+    html[data-theme="dark"] .overview-action-item strong,
+    html[data-theme="dark"] .decision-row-copy strong,
+    html[data-theme="dark"] .overview-busy-head strong {
+      color: var(--text);
+    }
+    html[data-theme="dark"] .nav-link small,
+    html[data-theme="dark"] .overview-hero-card .hint,
+    html[data-theme="dark"] .overview-action-item span,
+    html[data-theme="dark"] .overview-action-item small,
+    html[data-theme="dark"] .overview-busy-copy,
+    html[data-theme="dark"] .overview-busy-head span {
+      color: var(--muted);
+    }
+    html[data-theme="dark"] .status-chip,
+    html[data-theme="dark"] .usage-chip {
+      background:
+        linear-gradient(180deg, rgba(53, 62, 75, 0.5), rgba(35, 42, 52, 0.5)),
+        radial-gradient(circle at 100% 0%, rgba(214, 229, 252, 0.05), transparent 58%);
+      border-color: rgba(191, 203, 221, 0.12);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.05),
+        0 12px 26px rgba(1, 4, 9, 0.14);
+      backdrop-filter: blur(16px) saturate(118%);
+      -webkit-backdrop-filter: blur(16px) saturate(118%);
+    }
+    html[data-theme="dark"] .status-chip.usage-chip { box-shadow: var(--shadow-soft); }
+    html[data-theme="dark"] table,
+    html[data-theme="dark"] th,
+    html[data-theme="dark"] td {
+      border-color: var(--border-soft);
+      color: var(--text);
+    }
+    html[data-theme="dark"] tr:hover td { background: rgba(20, 30, 46, 0.72); }
+    html[data-theme="dark"] input,
+    html[data-theme="dark"] textarea,
+    html[data-theme="dark"] select {
+      background: rgba(12, 18, 29, 0.72);
+      color: var(--text);
+      border-color: var(--border-soft);
+    }
+    html[data-theme="dark"] .agent-animal-label,
+    html[data-theme="dark"] .staff-brief-identity h3,
+    html[data-theme="dark"] .office-info strong { color: var(--text); }
+    html[data-theme="dark"] .office-card,
+    html[data-theme="dark"] .staff-brief-card,
+    html[data-theme="dark"] .desk-chip,
+    html[data-theme="dark"] .group-item,
+    html[data-theme="dark"] .task-card,
+    html[data-theme="dark"] .project-card {
+      border-color: var(--card-border);
+      background: var(--card-fill);
+    }
+    html[data-theme="dark"] details summary { color: var(--text); }
+    html[data-theme="dark"] .card.compact-details summary { color: var(--text); }
+    html[data-theme="dark"] .card.compact-details summary::after,
+    html[data-theme="dark"] .compact-table-details summary::after {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(12, 18, 29, 0.72);
+      color: var(--muted);
+    }
+    html[data-theme="dark"] code { color: #7dd3fc; }
+    html[data-theme="dark"] .quota-row {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+    }
+    html[data-theme="dark"] .quota-label { color: var(--text); }
+    html[data-theme="dark"] .quota-track {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(23, 35, 52, 0.72);
+    }
+    html[data-theme="dark"] .subscription-pill,
+    html[data-theme="dark"] .file-sidebar {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .file-nav-item {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    }
+    html[data-theme="dark"] .file-nav-item:hover {
+      background: rgba(18, 28, 44, 0.86);
+      border-color: rgba(91, 175, 255, 0.24);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.4);
+    }
+    html[data-theme="dark"] .file-nav-item.active {
+      background: rgba(22, 35, 52, 0.92);
+      border-color: rgba(91, 175, 255, 0.34);
+      box-shadow: 0 14px 28px rgba(0, 0, 0, 0.48);
+    }
+    html[data-theme="dark"] .file-facet-switch .segment-item:hover {
+      border-color: rgba(226, 232, 240, 0.2);
+      background: rgba(18, 28, 44, 0.86);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.36);
+    }
+    html[data-theme="dark"] .file-filter-input,
+    html[data-theme="dark"] .file-token-input {
+      background: rgba(12, 18, 29, 0.72);
+      color: var(--text);
+      border-color: rgba(226, 232, 240, 0.16);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+    html[data-theme="dark"] .panel {
+      background:
+        linear-gradient(180deg, rgba(60, 71, 87, 0.22), rgba(33, 40, 51, 0.2)),
+        radial-gradient(circle at 100% 0%, rgba(232, 241, 255, 0.08), transparent 48%);
+      box-shadow:
+        0 30px 72px rgba(1, 4, 9, 0.08),
+        inset 0 1px 0 rgba(255, 255, 255, 0.065);
+      backdrop-filter: blur(42px) saturate(130%);
+      -webkit-backdrop-filter: blur(42px) saturate(130%);
+    }
+    html[data-theme="dark"] .mission-banner {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+      color: var(--text);
+    }
+    html[data-theme="dark"] .overview-primary-directive { color: var(--text); }
+    html[data-theme="dark"] .usage-chip,
+    html[data-theme="dark"] .status-chip.usage-chip {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+    }
+    html[data-theme="dark"] .exec-metric,
+    html[data-theme="dark"] .signal-gauge-core { color: var(--text); }
+    html[data-theme="dark"] strong { color: var(--text); }
+    html[data-theme="dark"] dt { color: var(--muted); }
+    html[data-theme="dark"] dd { color: var(--text); }
+    html[data-theme="dark"] .file-sidebar-tools .meta,
+    html[data-theme="dark"] .file-nav-title { color: var(--text); }
+    html[data-theme="dark"] .file-nav-meta,
+    html[data-theme="dark"] .file-editor-title,
+    html[data-theme="dark"] .file-editor-textarea {
+      color: var(--text);
+    }
+    html[data-theme="dark"] .file-editor-textarea {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.16);
+    }
+    html[data-theme="dark"] .decision-row:hover,
+    html[data-theme="dark"] .overview-action-item:hover {
+      background:
+        linear-gradient(180deg, rgba(29, 38, 50, 0.9), rgba(18, 24, 35, 0.86)),
+        radial-gradient(circle at 100% 0%, rgba(124, 188, 255, 0.05), transparent 56%);
+    }
+    html[data-theme="dark"] .card::before {
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.06),
+        inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+    }
+    html[data-theme="dark"] .status-chip strong { color: var(--text); }
+    html[data-theme="dark"] .status-chip span { color: var(--muted); }
+    html[data-theme="dark"] .overview-primary-card {
+      background:
+        linear-gradient(150deg, rgba(88, 101, 121, 0.42), rgba(51, 60, 74, 0.46)),
+        radial-gradient(circle at 88% 18%, rgba(225, 236, 255, 0.08), transparent 56%);
+      border-color: rgba(223, 231, 242, 0.12);
+      box-shadow:
+        0 22px 46px rgba(1, 4, 9, 0.1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.07);
+    }
+    html[data-theme="dark"] .overview-primary-card::after {
+      background: radial-gradient(circle, rgba(225, 236, 255, 0.08), transparent 68%);
+    }
+    html[data-theme="dark"] .overview-primary-value,
+    html[data-theme="dark"] .overview-focus-score { color: var(--text); }
+    html[data-theme="dark"] .overview-focus-stage {
+      border-color: rgba(223, 231, 242, 0.1);
+      background:
+        linear-gradient(180deg, rgba(63, 73, 88, 0.34), rgba(39, 47, 58, 0.38)),
+        radial-gradient(circle at 100% 0%, rgba(225, 236, 255, 0.05), transparent 58%);
+    }
+    html[data-theme="dark"] .overview-focus-ring {
+      border-color: rgba(217, 227, 242, 0.12);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+    }
+    html[data-theme="dark"] .overview-focus-core {
+      background: linear-gradient(180deg, rgba(53, 62, 76, 0.56), rgba(34, 41, 52, 0.6));
+      border-color: rgba(223, 231, 242, 0.11);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.06),
+        0 8px 18px rgba(1, 4, 9, 0.08);
+    }
+    html[data-theme="dark"] .overview-primary-directive,
+    html[data-theme="dark"] .overview-primary-label { color: var(--muted); }
+    html[data-theme="dark"] .overview-focus-headline { color: var(--text); }
+    html[data-theme="dark"] .overview-focus-sub,
+    html[data-theme="dark"] .overview-focus-meta,
+    html[data-theme="dark"] .overview-focus-unit { color: var(--muted); }
+    html[data-theme="dark"] #usage-pulse .usage-chip {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+    }
+    html[data-theme="dark"] #usage-pulse .usage-chip span,
+    html[data-theme="dark"] #usage-pulse .usage-chip strong { color: var(--text); }
+    html[data-theme="dark"] #usage-pulse .usage-chip {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+    }
+    html[data-theme="dark"] #usage-pulse .usage-chip span,
+    html[data-theme="dark"] #usage-pulse .usage-chip strong { color: var(--text); }
+    html[data-theme="dark"] .signal-gauge-core {
+      background: rgba(12, 18, 29, 0.92);
+      border-color: rgba(226, 232, 240, 0.16);
+    }
+    html[data-theme="dark"] .signal-gauge-meta small { color: var(--muted); }
+    html[data-theme="dark"] .signal-gauge-meta a { color: var(--focus); }
+    html[data-theme="dark"] .cron-owner-card {
+      border-color: rgba(226, 232, 240, 0.12);
+      background:
+        linear-gradient(180deg, rgba(29, 35, 46, 0.9), rgba(20, 25, 34, 0.88)),
+        radial-gradient(circle at 100% 0%, rgba(124, 188, 255, 0.04), transparent 58%);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .cron-owner-head h3,
+    html[data-theme="dark"] .cron-job-head strong { color: var(--text); }
+    html[data-theme="dark"] .cron-job-list li {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .calendar-day {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .calendar-day h3 { color: var(--text); }
+    html[data-theme="dark"] .calendar-event {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .file-editor-panel {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .pie-chart {
+      border-color: rgba(226, 232, 240, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 8px 18px rgba(0, 0, 0, 0.4);
+    }
+    html[data-theme="dark"] .pie-hole {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(12, 18, 29, 0.92);
+    }
+    html[data-theme="dark"] .pie-hole strong { color: var(--text); }
+    html[data-theme="dark"] .pie-legend li { color: var(--text); border-bottom-color: rgba(226, 232, 240, 0.12); }
+    html[data-theme="dark"] summary { color: var(--text); }
+    html[data-theme="dark"] .empty-state {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(18, 28, 44, 0.72);
+      color: var(--muted);
+    }
+    html[data-theme="dark"] .overview-focus-headline { color: var(--text); }
+    html[data-theme="dark"] .overview-focus-sub,
+    html[data-theme="dark"] .overview-focus-meta,
+    html[data-theme="dark"] .overview-focus-unit { color: var(--muted); }
+    html[data-theme="dark"] .overview-primary-directive {
+      border-color: rgba(223, 231, 242, 0.1);
+      background:
+        linear-gradient(180deg, rgba(92, 105, 124, 0.26), rgba(57, 67, 81, 0.3)),
+        radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.025), transparent 58%);
+      color: rgba(240, 244, 249, 0.94);
+    }
+    html[data-theme="dark"] .overview-kpi-card::before {
+      height: 1px;
+      opacity: 1;
+      background: linear-gradient(90deg, rgba(224, 232, 242, 0.18), rgba(224, 232, 242, 0.02));
+    }
+    html[data-theme="dark"] .overview-kpi-card.tone-warn {
+      border-color: rgba(214, 170, 90, 0.18);
+      background:
+        linear-gradient(180deg, rgba(43, 32, 20, 0.68), rgba(21, 22, 29, 0.9)),
+        radial-gradient(circle at 100% 0%, rgba(214, 170, 90, 0.08), transparent 54%);
+    }
+    html[data-theme="dark"] .overview-kpi-card.tone-warn::before {
+      background: linear-gradient(90deg, rgba(218, 168, 69, 0.64), rgba(218, 168, 69, 0.14));
+    }
+    html[data-theme="dark"] .overview-kpi-card.tone-neutral {
+      border-color: rgba(191, 203, 221, 0.12);
+      background: var(--card-fill-soft);
+    }
+    html[data-theme="dark"] .overview-kpi-card.tone-neutral::before {
+      background: linear-gradient(90deg, rgba(187, 195, 206, 0.26), rgba(187, 195, 206, 0.05));
+    }
+    html[data-theme="dark"] .overview-hero-card,
+    html[data-theme="dark"] .exec-card,
+    html[data-theme="dark"] .overview-busy-card,
+    html[data-theme="dark"] .overview-action-item,
+    html[data-theme="dark"] .decision-row,
+    html[data-theme="dark"] .overview-task-strip,
+    html[data-theme="dark"] .lane,
+    html[data-theme="dark"] .queue-item,
+    html[data-theme="dark"] .task-chip,
+    html[data-theme="dark"] .project-chip,
+    html[data-theme="dark"] .group-item,
+    html[data-theme="dark"] .group-section summary {
+      border-color: rgba(223, 231, 242, 0.09);
+      background: var(--card-fill-soft);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.05),
+        0 14px 30px rgba(1, 4, 9, 0.1);
+      backdrop-filter: blur(20px) saturate(124%);
+      -webkit-backdrop-filter: blur(20px) saturate(124%);
+    }
+    html[data-theme="dark"] .task-hub-primary,
+    html[data-theme="dark"] #current-task-health {
+      background:
+        linear-gradient(150deg, rgba(70, 81, 98, 0.38), rgba(43, 50, 61, 0.42)),
+        radial-gradient(circle at 88% 18%, rgba(214, 229, 252, 0.07), transparent 54%);
+      border-color: rgba(217, 227, 242, 0.11);
+      box-shadow:
+        0 20px 48px rgba(1, 4, 9, 0.14),
+        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    }
+    html[data-theme="dark"] .overview-action-item.hot {
+      border-color: rgba(214, 170, 90, 0.18);
+      background:
+        linear-gradient(180deg, rgba(43, 32, 20, 0.66), rgba(19, 23, 31, 0.88)),
+        radial-gradient(circle at 100% 0%, rgba(214, 170, 90, 0.07), transparent 56%);
+    }
+    html[data-theme="dark"] .signal-gauge-core {
+      background: rgba(12, 18, 29, 0.92);
+      border-color: rgba(226, 232, 240, 0.16);
+    }
+    html[data-theme="dark"] .signal-gauge-meta small { color: var(--muted); }
+    html[data-theme="dark"] .signal-gauge-meta a { color: var(--focus); }
+    html[data-theme="dark"] .cron-owner-card {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .cron-owner-head h3,
+    html[data-theme="dark"] .cron-job-head strong { color: var(--text); }
+    html[data-theme="dark"] .cron-job-list li {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .calendar-day {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .calendar-day h3 { color: var(--text); }
+    html[data-theme="dark"] .calendar-event {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .file-editor-panel {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .pie-chart {
+      border-color: rgba(226, 232, 240, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 8px 18px rgba(0, 0, 0, 0.4);
+    }
+    html[data-theme="dark"] .pie-hole {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(12, 18, 29, 0.92);
+    }
+    html[data-theme="dark"] .pie-hole strong { color: var(--text); }
+    html[data-theme="dark"] .pie-legend li { color: var(--text); border-bottom-color: rgba(226, 232, 240, 0.12); }
+    html[data-theme="dark"] summary { color: var(--text); }
     .staff-brief-identity h3 {
       margin: 0;
       font-size: 20px;
@@ -7862,6 +9502,7 @@ async function renderHtml(
       .overview-busy-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .office-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .staff-brief-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .collaboration-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 1320px) {
       .app-shell { grid-template-columns: 1fr 284px; }
@@ -7878,6 +9519,10 @@ async function renderHtml(
       .overview-busy-grid { grid-template-columns: 1fr; }
       .dashboard-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .execution-chain-list { grid-template-columns: 1fr; }
+      .collaboration-thread-head { grid-template-columns: 1fr; }
+      .collaboration-thread-badges { justify-items: start; }
+      .collaboration-current-owner { text-align: left; }
+      .collaboration-timeline-step { grid-template-columns: 1fr; }
       .file-workbench { grid-template-columns: 1fr; }
       .staff-brief-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
@@ -7903,6 +9548,9 @@ async function renderHtml(
       .task-hub-board-grid { grid-template-columns: 1fr; }
       .overview-pulse-card .status-strip { grid-template-columns: 1fr; }
       .dashboard-strip { grid-template-columns: 1fr; }
+      .collaboration-summary-grid { grid-template-columns: 1fr; }
+      .collaboration-route-avatars { flex-wrap: wrap; }
+      .collaboration-avatar { width: 54px; max-width: 54px; }
       .signal-gauge-main { grid-template-columns: 64px minmax(0, 1fr); }
       .office-grid { grid-template-columns: 1fr; }
       .staff-brief-head { grid-template-columns: 1fr; }
@@ -7928,11 +9576,27 @@ async function renderHtml(
     }
   </style>
 </head>
-<body class="ui-preload" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
+<body class="ui-preload" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" data-token-required="${LOCAL_TOKEN_AUTH_REQUIRED ? "1" : "0"}" data-token-configured="${LOCAL_API_TOKEN ? "1" : "0"}" data-local-token-header="${escapeHtml(LOCAL_TOKEN_HEADER)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-kicker">OpenClaw</div>
+        <div class="brand-bar">
+          <div class="brand-kicker">OpenClaw</div>
+          <div class="brand-actions">
+            <button id="theme-toggle" type="button" class="icon-btn" aria-label="${escapeHtml(t("Toggle theme", "切换主题"))}" title="${escapeHtml(t("Toggle theme", "切换主题"))}">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M12 18.5a6.5 6.5 0 1 0 0-13a6.5 6.5 0 0 0 0 13Z" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M12 2.8v2.2M12 19v2.2M3.6 12h2.2M18.2 12h2.2M5.1 5.1l1.6 1.6M17.3 17.3l1.6 1.6M18.9 5.1l-1.6 1.6M6.7 17.3l-1.6 1.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <button id="data-refresh" type="button" class="icon-btn" aria-label="${escapeHtml(t("Refresh data", "刷新数据"))}" title="${escapeHtml(t("Refresh data", "刷新数据"))}">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M20 12a8 8 0 1 1-2.34-5.66" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                <path d="M20 4v6h-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
         <h1>OpenClaw Control Center</h1>
         <div class="meta">${escapeHtml(t("Updated", "更新时间"))}${escapeHtml(options.language === "en" ? ": " : "：")}${escapeHtml(snapshot.generatedAt ?? t("Not available", "暂无"))}</div>
         ${languageToggle}
@@ -7994,7 +9658,10 @@ async function renderHtml(
   ${agentVisualEnhancerScript}
   ${fileWorkbenchScript}
   ${nativeMotionScript}
+  ${collaborationFilterScript}
   ${quotaResetScript}
+  ${headerControlsScript}
+  ${avatarEditorScript}
 </body>
 </html>`;
 }
@@ -8077,7 +9744,7 @@ function parseSessionQuery(searchParams: URLSearchParams, strict: boolean): Sess
   return {
     filters,
     page: readPositiveIntQuery(searchParams.get("page"), "page", 1, strict),
-    pageSize: readPositiveIntQuery(searchParams.get("pageSize"), "pageSize", 20, strict, 100),
+    pageSize: readPositiveIntQuery(searchParams.get("pageSize"), "pageSize", 12, strict, 100),
     historyLimit: readPositiveIntQuery(searchParams.get("historyLimit"), "historyLimit", 8, strict, 200),
   };
 }
@@ -8659,7 +10326,9 @@ function resolveStaffWorkspaceRoot(member: TeamMemberSnapshot): string {
   const key = normalizeLookupKey(member.agentId);
   if (key === "main") return OPENCLAW_WORKSPACE_ROOT;
   const workspace = member.workspace.trim();
-  if (workspace && workspace !== "未标注" && workspace !== "unlisted") return workspace;
+  if (workspace && workspace !== "未标注" && workspace !== "unlisted") {
+    return resolve(OPENCLAW_CONFIG_DIR, workspace);
+  }
   return join(OPENCLAW_WORKSPACE_ROOT, "agents", member.agentId);
 }
 
@@ -8828,13 +10497,12 @@ async function buildEditableFileEntry(input: {
     if (!meta.isFile() || meta.size > EDITABLE_TEXT_FILE_MAX_BYTES) return undefined;
     const raw = await safeReadTextFile(input.sourcePath);
     if (raw === undefined) return undefined;
-    const ext = extname(input.sourcePath).toLowerCase();
     const relativePath = input.relativeBase
       ? relative(input.relativeBase, input.sourcePath) || basename(input.sourcePath)
       : basename(input.sourcePath);
     return {
       scope: input.scope,
-      title: extractMarkdownHeading(raw) || basename(input.sourcePath, ext) || basename(input.sourcePath),
+      title: basename(input.sourcePath) || relativePath,
       excerpt: toPlainSummary(raw, 160),
       category: input.category,
       sourcePath: input.sourcePath,
@@ -8880,7 +10548,7 @@ async function listEditableMemoryFiles(): Promise<EditableFileEntry[]> {
 
   const append = async (entry: EditableFileEntry | undefined): Promise<void> => {
     if (!entry) return;
-    const key = resolve(entry.sourcePath);
+    const key = `${entry.facetKey ?? ""}::${resolve(entry.sourcePath)}`;
     if (seen.has(key)) return;
     seen.add(key);
     output.push(entry);
@@ -8977,7 +10645,7 @@ async function listEditableWorkspaceFiles(): Promise<EditableFileEntry[]> {
 
   const append = async (entry: EditableFileEntry | undefined): Promise<void> => {
     if (!entry) return;
-    const key = resolve(entry.sourcePath);
+    const key = `${entry.facetKey ?? ""}::${resolve(entry.sourcePath)}`;
     if (seen.has(key)) return;
     seen.add(key);
     output.push(entry);
@@ -9032,6 +10700,8 @@ function documentFilePriority(relativePath: string): number {
     "agents.md",
     "identity.md",
     "soul.md",
+    "user.md",
+    "tasks.md",
     "bootstrap.md",
     "heartbeat.md",
     "tools.md",
@@ -9121,7 +10791,7 @@ function resolveEditableAgentScopesFromConfig(input: unknown): EditableAgentScop
     const workspaceRoot =
       facetKey === "main"
         ? OPENCLAW_WORKSPACE_ROOT
-        : resolve(asString(row.workspace)?.trim() || join(OPENCLAW_WORKSPACE_ROOT, "agents", rawId));
+        : resolveConfiguredWorkspaceRoot(asString(row.workspace)?.trim(), rawId);
     output.push({
       agentId: rawId,
       facetKey,
@@ -9203,6 +10873,12 @@ function resolveEditableAgentScopesFromWorkspaceAgentIds(agentIds: string[]): Ed
     });
   }
   return scopes.sort(compareEditableAgentScopes);
+}
+
+function resolveConfiguredWorkspaceRoot(rawWorkspace: string | undefined, agentId: string): string {
+  const workspace = rawWorkspace?.trim();
+  if (workspace) return resolve(OPENCLAW_CONFIG_DIR, workspace);
+  return join(OPENCLAW_WORKSPACE_ROOT, "agents", agentId);
 }
 
 async function resolveEditableFileEntry(
@@ -10394,7 +12070,11 @@ export async function buildStaffOverviewCards(input: {
   }));
 }
 
-function renderStaffOverviewCards(cards: StaffOverviewCard[], language: UiLanguage = "zh"): string {
+function renderStaffOverviewCards(
+  cards: StaffOverviewCard[],
+  avatarPreferences: Awaited<ReturnType<typeof loadAvatarPreferences>>["preferences"],
+  language: UiLanguage = "zh",
+): string {
   if (cards.length === 0) {
     return `<div class="empty-state">${escapeHtml(
       pickUiText(language, "No staff summary is available yet.", "当前没有可显示的员工摘要。"),
@@ -10403,10 +12083,24 @@ function renderStaffOverviewCards(cards: StaffOverviewCard[], language: UiLangua
 
   return `<div class="staff-brief-grid">${cards
     .map((card) => {
-      const avatar = `<div class="staff-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}">
-        <div class="agent-stage" aria-hidden="true">
-          <canvas class="agent-pixel-canvas" width="256" height="256"></canvas>
-        </div>
+      const effective = resolveEffectiveAvatar({
+        agentId: card.agentId,
+        agentAnimal: card.identity.animal,
+        preferences: avatarPreferences,
+      });
+      const effectiveAnimal = effective.mode === "pixel" ? effective.animal : card.identity.animal;
+      const stageInner =
+        effective.mode === "custom"
+          ? `<img class="agent-avatar-img" src="/avatars/${escapeHtml(effective.image)}" alt="${escapeHtml(card.displayName)}" loading="lazy" />`
+          : `<canvas class="agent-pixel-canvas" width="256" height="256"></canvas>`;
+      const avatar = `<div class="staff-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(effectiveAnimal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
+        <div class="agent-stage" aria-hidden="true">${stageInner}</div>
+        <button type="button" class="avatar-edit-btn" aria-label="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}" title="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 20h4l10.6-10.6a2.2 2.2 0 0 0 0-3.1l-0.9-0.9a2.2 2.2 0 0 0-3.1 0L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M13.8 6.2l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>`;
       return `<article class="staff-brief-card">
         <div class="staff-brief-head">
@@ -10476,7 +12170,7 @@ function buildTaskExecutionChainCards(input: {
       sessionKey: sessionLike.sessionKey,
       agentId: sessionLike.agentId,
       state: sessionLike.state,
-      latestAt: preview?.latestHistoryAt ?? sessionLike.lastMessageAt,
+      latestAt: pickLatestSessionActivityTimestamp(preview?.latestHistoryAt, sessionLike.lastMessageAt),
       latestSnippet: preview?.latestSnippet,
       executionChain,
       sessionHref: buildSessionDetailHref(sessionLike.sessionKey, input.language),
@@ -10920,7 +12614,1070 @@ function renderTaskExecutionChainCards(
     .join("")}</div>`;
 }
 
-function renderOfficeCards(cards: OfficeSpaceCard[], language: UiLanguage = "zh"): string {
+function buildCollaborationThreadCards(input: {
+  cards: TaskExecutionChainCard[];
+  sessionItems: SessionConversationListItem[];
+  language: UiLanguage;
+}): CollaborationThreadCard[] {
+  const sessionByKey = new Map(input.sessionItems.map((item) => [item.sessionKey, item]));
+
+  const resolved: CollaborationThreadCard[] = input.cards.map((card): CollaborationThreadCard => {
+    const chain = card.executionChain;
+    const parentSessionKey = chain.parentSessionKey ?? card.sessionKey;
+    const childSessionKey = chain.childSessionKey;
+    const hasChildSession = Boolean(childSessionKey);
+    const parentSession = sessionByKey.get(parentSessionKey);
+    const childSession = childSessionKey ? sessionByKey.get(childSessionKey) : undefined;
+    const ownerAgentId = normalizeAgentIdCandidate(card.agentId ?? card.owner);
+    const parentAgentId =
+      normalizeAgentIdCandidate(parentSession?.agentId) ??
+      normalizeAgentIdCandidate(extractAgentIdFromSessionKey(parentSessionKey ?? "")) ??
+      ownerAgentId ??
+      "main";
+    const childAgentId =
+      normalizeAgentIdCandidate(childSession?.agentId) ??
+      normalizeAgentIdCandidate(extractAgentIdFromSessionKey(childSessionKey ?? "")) ??
+      normalizeAgentIdCandidate(card.agentId) ??
+      parentAgentId;
+    const routeAgentIds = childSessionKey ? [parentAgentId, childAgentId] : [parentAgentId];
+    const status = resolveCollaborationThreadStatus(card);
+    const currentOwnerAgentId = resolveCollaborationCurrentOwner(card, parentAgentId, childAgentId);
+    const currentOwnerRole: "parent" | "child" = hasChildSession || chain.spawned ? "child" : "parent";
+    const latestAt = pickLatestTimestamp([
+      childSession?.latestHistoryAt,
+      childSession?.lastMessageAt,
+      parentSession?.latestHistoryAt,
+      parentSession?.lastMessageAt,
+      card.latestAt,
+      chain.spawnedAt,
+      chain.acceptedAt,
+    ]);
+    const participants = routeAgentIds.map((agentId, index) => ({
+      agentId,
+      label: humanizeOperatorLabel(agentId),
+      identity: deriveAgentAnimalIdentity(agentId),
+      current: normalizeLookupKey(agentId) === normalizeLookupKey(currentOwnerAgentId ?? ""),
+      roleLabel: collaborationParticipantRoleLabel(index === 0 ? "parent" : "child", input.language),
+    }));
+    const uniqueParticipantCount = new Set(routeAgentIds.map((agentId) => normalizeLookupKey(agentId))).size;
+    const multiAgent = uniqueParticipantCount > 1;
+    const mainDispatched =
+      routeAgentIds.length > 1 && normalizeLookupKey(routeAgentIds[0] ?? "") === "main";
+    const routeTitle = collaborationRouteLabel(parentAgentId, childAgentId, hasChildSession, input.language);
+    const taskTitle = deriveCollaborationTaskTitle({
+      card,
+      parentSession,
+      childSession,
+      language: input.language,
+    });
+    const latestSnippetSource =
+      childSession?.latestSnippet ?? parentSession?.latestSnippet ?? card.latestSnippet ?? chain.detail;
+    const latestSnippet = summarizeVisibleSessionSnippet(latestSnippetSource, input.language, 120);
+    const timeline = buildCollaborationTimelineSteps({
+      card,
+      parentAgentId,
+      childAgentId,
+      parentSession,
+      childSession,
+      language: input.language,
+    });
+
+    return {
+      id: `${card.sessionKey}:${routeAgentIds.join("->")}`,
+      kind: "parent_child",
+      sessionKey: card.sessionKey,
+      taskTitle,
+      routeTitle,
+      summary: collaborationThreadSummary({
+        card,
+        status,
+        parentAgentId,
+        childAgentId,
+        language: input.language,
+      }),
+      status,
+      statusBadge: collaborationThreadStatusLabel(status, input.language),
+      kindBadge: collaborationThreadKindLabel("parent_child", input.language),
+      currentOwnerLabel: collaborationRoleAgentLabel(
+        currentOwnerRole,
+        currentOwnerAgentId ?? routeAgentIds.at(-1) ?? parentAgentId,
+        input.language,
+      ),
+      currentOwnerAgentId,
+      currentOwnerRole,
+      latestAt,
+      latestAtLabel: latestAt
+        ? pickUiText(input.language, `Updated ${formatTimeAgoFromNow(latestAt, input.language)}`, `最近更新 ${formatTimeAgoFromNow(latestAt, input.language)}`)
+        : pickUiText(input.language, "No visible update yet", "还没有可见更新"),
+      participants,
+      routeJoiner: "→",
+      multiAgent,
+      mainDispatched,
+      aggregateCount: 1,
+      aggregateItems: [{ sessionKey: card.sessionKey, sessionHref: card.sessionHref, latestAt }],
+      taskHref: card.taskHref,
+      sessionHref: card.sessionHref,
+      timeline,
+      latestSnippet,
+      sourceLabel: executionChainSourceLabel(chain, input.language),
+      parentSessionKey,
+      childSessionKey,
+    };
+  });
+
+  const grouped = foldCollaborationThreadCards(resolved, input.language);
+
+  return grouped.sort((a, b) => {
+    const statusRank = collaborationStatusRank(b.status) - collaborationStatusRank(a.status);
+    if (statusRank !== 0) return statusRank;
+    const timeRank = toSortableMs(b.latestAt) - toSortableMs(a.latestAt);
+    if (timeRank !== 0) return timeRank;
+    return a.routeTitle.localeCompare(b.routeTitle);
+  });
+}
+
+function foldCollaborationThreadCards(
+  cards: CollaborationThreadCard[],
+  language: UiLanguage,
+): CollaborationThreadCard[] {
+  const passthrough: CollaborationThreadCard[] = [];
+  const groups = new Map<string, CollaborationThreadCard[]>();
+
+  for (const card of cards) {
+    const shouldFold = card.status === "completed" && !card.multiAgent;
+    if (!shouldFold) {
+      passthrough.push(card);
+      continue;
+    }
+    const groupKey = [
+      normalizeLookupKey(card.routeTitle),
+      normalizeLookupKey(card.taskTitle),
+      normalizeLookupKey(card.currentOwnerAgentId ?? ""),
+    ].join("::");
+    const existing = groups.get(groupKey) ?? [];
+    existing.push(card);
+    groups.set(groupKey, existing);
+  }
+
+  const folded: CollaborationThreadCard[] = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      folded.push(group[0]);
+      continue;
+    }
+    const ordered = [...group].sort((a, b) => toSortableMs(b.latestAt) - toSortableMs(a.latestAt));
+    const latest = ordered[0];
+    const aggregateItems = ordered.map((item) => ({
+      sessionKey: item.sessionKey,
+      sessionHref: item.sessionHref,
+      latestAt: item.latestAt,
+    }));
+    const ownerLabel = latest.currentOwnerLabel;
+    const countLabel = pickUiText(language, `${group.length} similar runs`, `${group.length} 条相近协作`);
+    folded.push({
+      ...latest,
+      summary: pickUiText(
+        language,
+        `${ownerLabel} finished ${group.length} similar collaboration runs recently. The latest timeline stays expanded here, and the rest are folded into this card.`,
+        `${ownerLabel} 最近完成了 ${group.length} 条相近协作。这里保留最新一条时间线，其余同类线程已折叠到这张卡里。`,
+      ),
+      latestAtLabel: latest.latestAt
+        ? pickUiText(
+            language,
+            `Updated ${formatTimeAgoFromNow(latest.latestAt, language)} · ${countLabel}`,
+            `最近更新 ${formatTimeAgoFromNow(latest.latestAt, language)} · ${countLabel}`,
+          )
+        : pickUiText(language, `No visible update yet · ${countLabel}`, `还没有可见更新 · ${countLabel}`),
+      aggregateCount: group.length,
+      aggregateItems,
+      sourceLabel: pickUiText(
+        language,
+        `Showing the latest representative thread. ${group.length} similar completed runs are folded together.`,
+        `当前展示最新一条代表线程；另有 ${group.length} 条相近的已完成协作已折叠显示。`,
+      ),
+    });
+  }
+
+  return [...passthrough, ...folded];
+}
+
+function buildInterSessionCollaborationCards(input: {
+  sessionItems: SessionConversationListItem[];
+  language: UiLanguage;
+}): CollaborationThreadCard[] {
+  const sessionByKey = new Map(input.sessionItems.map((item) => [item.sessionKey, item]));
+  const grouped = new Map<
+    string,
+    Array<{
+      sourceSessionKey: string;
+      targetSessionKey: string;
+      sourceTool?: string;
+      snippet: string;
+      at?: string;
+    }>
+  >();
+
+  for (const targetSession of input.sessionItems) {
+    for (const signal of targetSession.interSessionSignals ?? []) {
+      const sourceKey = signal.sourceSessionKey.trim();
+      const targetKey = targetSession.sessionKey.trim();
+      if (!sourceKey || !targetKey || normalizeLookupKey(sourceKey) === normalizeLookupKey(targetKey)) continue;
+      const sourceSession = sessionByKey.get(sourceKey);
+      const taskSeed = normalizeLookupKey(
+        deriveInterSessionTaskTitle({
+          signalSnippet: signal.snippet,
+          sourceSession,
+          targetSession,
+          language: input.language,
+        }),
+      );
+      const pairKey = [sourceKey, targetKey].sort().join("::");
+      const groupKey = `${pairKey}::${taskSeed || "shared"}`;
+      const existing = grouped.get(groupKey) ?? [];
+      existing.push({
+        sourceSessionKey: sourceKey,
+        targetSessionKey: targetKey,
+        sourceTool: signal.sourceTool,
+        snippet: signal.snippet,
+        at: signal.timestamp,
+      });
+      grouped.set(groupKey, existing);
+    }
+  }
+
+  const cards: CollaborationThreadCard[] = [];
+  for (const signals of grouped.values()) {
+    const orderedSignals = [...signals].sort((a, b) => toSortableMs(a.at) - toSortableMs(b.at));
+    const latest = orderedSignals.at(-1);
+    if (!latest) continue;
+
+    const sourceSession = sessionByKey.get(latest.sourceSessionKey);
+    const targetSession = sessionByKey.get(latest.targetSessionKey);
+    const sourceAgentId =
+      normalizeAgentIdCandidate(sourceSession?.agentId) ??
+      normalizeAgentIdCandidate(extractAgentIdFromSessionKey(latest.sourceSessionKey)) ??
+      "main";
+    const targetAgentId =
+      normalizeAgentIdCandidate(targetSession?.agentId) ??
+      normalizeAgentIdCandidate(extractAgentIdFromSessionKey(latest.targetSessionKey)) ??
+      "main";
+    const bidirectional =
+      orderedSignals.some(
+        (signal) =>
+          normalizeLookupKey(signal.sourceSessionKey) === normalizeLookupKey(latest.targetSessionKey) &&
+          normalizeLookupKey(signal.targetSessionKey) === normalizeLookupKey(latest.sourceSessionKey),
+      );
+    const latestAt = pickLatestTimestamp([
+      latest.at,
+      targetSession?.latestHistoryAt,
+      targetSession?.lastMessageAt,
+      sourceSession?.latestHistoryAt,
+      sourceSession?.lastMessageAt,
+    ]);
+    const status = resolveInterSessionCollaborationStatus({
+      sourceSession,
+      targetSession,
+      bidirectional,
+    });
+    const currentOwnerAgentId = targetAgentId;
+    const taskTitle = deriveInterSessionTaskTitle({
+      signalSnippet: latest.snippet,
+      sourceSession,
+      targetSession,
+      language: input.language,
+    });
+    const participants: CollaborationParticipant[] = [
+      {
+        agentId: sourceAgentId,
+        label: humanizeOperatorLabel(sourceAgentId),
+        identity: deriveAgentAnimalIdentity(sourceAgentId),
+        current: normalizeLookupKey(sourceAgentId) === normalizeLookupKey(currentOwnerAgentId),
+        roleLabel: pickUiText(input.language, "Sending session", "发送会话"),
+      },
+      {
+        agentId: targetAgentId,
+        label: humanizeOperatorLabel(targetAgentId),
+        identity: deriveAgentAnimalIdentity(targetAgentId),
+        current: normalizeLookupKey(targetAgentId) === normalizeLookupKey(currentOwnerAgentId),
+        roleLabel: pickUiText(input.language, "Receiving session", "接收会话"),
+      },
+    ];
+    cards.push({
+      id: `inter-session:${latest.sourceSessionKey}->${latest.targetSessionKey}:${normalizeLookupKey(taskTitle)}`,
+      kind: "inter_session",
+      sessionKey: latest.targetSessionKey,
+      taskTitle,
+      routeTitle: collaborationInterSessionRouteLabel(sourceAgentId, targetAgentId, input.language),
+      summary: collaborationInterSessionSummary({
+        status,
+        sourceAgentId,
+        targetAgentId,
+        bidirectional,
+        language: input.language,
+      }),
+      status,
+      statusBadge: collaborationThreadStatusLabel(status, input.language),
+      kindBadge: collaborationThreadKindLabel("inter_session", input.language),
+      currentOwnerLabel: collaborationInterSessionCurrentOwnerLabel(targetAgentId, input.language),
+      currentOwnerAgentId,
+      currentOwnerRole: "target",
+      latestAt,
+      latestAtLabel: latestAt
+        ? pickUiText(input.language, `Updated ${formatTimeAgoFromNow(latestAt, input.language)}`, `最近更新 ${formatTimeAgoFromNow(latestAt, input.language)}`)
+        : pickUiText(input.language, "No visible update yet", "还没有可见更新"),
+      participants,
+      routeJoiner: "⇄",
+      multiAgent: normalizeLookupKey(sourceAgentId) !== normalizeLookupKey(targetAgentId),
+      mainDispatched: normalizeLookupKey(sourceAgentId) === "main",
+      aggregateCount: 1,
+      aggregateItems: [
+        {
+          sessionKey: latest.targetSessionKey,
+          sessionHref: buildSessionDetailHref(latest.targetSessionKey, input.language),
+          latestAt,
+        },
+      ],
+      taskHref: undefined,
+      sessionHref: buildSessionDetailHref(latest.targetSessionKey, input.language),
+      timeline: buildInterSessionCollaborationTimelineSteps({
+        sourceAgentId,
+        targetAgentId,
+        sourceSession,
+        targetSession,
+        signals: orderedSignals,
+        language: input.language,
+      }),
+      latestSnippet: summarizeVisibleSessionSnippet(latest.snippet, input.language, 140),
+      sourceLabel: pickUiText(
+        input.language,
+        `Verified via inter-session message (${latest.sourceTool ?? "inter-session"}).`,
+        `已通过跨会话消息验证（${latest.sourceTool ?? "inter-session"}）。`,
+      ),
+      parentSessionKey: latest.sourceSessionKey,
+      childSessionKey: latest.targetSessionKey,
+    });
+  }
+
+  return cards;
+}
+
+function mergeCollaborationThreadCards(
+  primary: CollaborationThreadCard[],
+  secondary: CollaborationThreadCard[],
+): CollaborationThreadCard[] {
+  const combined = [...primary, ...secondary];
+  return combined.sort((a, b) => {
+    const statusRank = collaborationStatusRank(b.status) - collaborationStatusRank(a.status);
+    if (statusRank !== 0) return statusRank;
+    const timeRank = toSortableMs(b.latestAt) - toSortableMs(a.latestAt);
+    if (timeRank !== 0) return timeRank;
+    if (a.kind !== b.kind) return a.kind === "inter_session" ? -1 : 1;
+    return a.routeTitle.localeCompare(b.routeTitle);
+  });
+}
+
+function collaborationThreadKindLabel(
+  kind: CollaborationThreadKind,
+  language: UiLanguage = "zh",
+): string {
+  if (kind === "inter_session") {
+    return pickUiText(language, "Cross-session communication", "跨会话通信");
+  }
+  return pickUiText(language, "Parent-child relay", "父子协作");
+}
+
+function deriveInterSessionTaskTitle(input: {
+  signalSnippet: string;
+  sourceSession?: SessionConversationListItem;
+  targetSession?: SessionConversationListItem;
+  language: UiLanguage;
+}): string {
+  const candidates = [
+    input.sourceSession?.taskSnippet,
+    input.targetSession?.taskSnippet,
+    input.sourceSession?.label,
+    input.targetSession?.label,
+    input.signalSnippet,
+    input.sourceSession?.latestSnippet,
+    input.targetSession?.latestSnippet,
+  ];
+  for (const candidate of candidates) {
+    const derived = extractCollaborationTaskLabel(candidate ?? "", input.language);
+    if (derived?.trim()) return derived;
+  }
+  return pickUiText(input.language, "Cross-session communication", "跨会话沟通");
+}
+
+function resolveInterSessionCollaborationStatus(input: {
+  sourceSession?: SessionConversationListItem;
+  targetSession?: SessionConversationListItem;
+  bidirectional: boolean;
+}): CollaborationThreadStatus {
+  const states = [input.sourceSession?.state, input.targetSession?.state];
+  if (states.some((state) => state === "blocked" || state === "error" || state === "waiting_approval")) {
+    return "blocked";
+  }
+  if (states.some((state) => state === "running")) {
+    return "active";
+  }
+  if (!input.bidirectional) {
+    return "handoff";
+  }
+  const latestAt = pickLatestTimestamp([
+    input.sourceSession?.latestHistoryAt,
+    input.sourceSession?.lastMessageAt,
+    input.targetSession?.latestHistoryAt,
+    input.targetSession?.lastMessageAt,
+  ]);
+  const latestMs = toSortableMs(latestAt);
+  if (latestMs && Date.now() - latestMs <= 15 * 60 * 1000) {
+    return "active";
+  }
+  return "completed";
+}
+
+function collaborationInterSessionRouteLabel(
+  sourceAgentId: string,
+  targetAgentId: string,
+  language: UiLanguage = "zh",
+): string {
+  return `${pickUiText(language, "Sending session", "发送会话")} ${humanizeOperatorLabel(sourceAgentId)} ⇄ ${pickUiText(language, "Receiving session", "接收会话")} ${humanizeOperatorLabel(targetAgentId)}`;
+}
+
+function collaborationInterSessionSummary(input: {
+  status: CollaborationThreadStatus;
+  sourceAgentId: string;
+  targetAgentId: string;
+  bidirectional: boolean;
+  language: UiLanguage;
+}): string {
+  const sourceLabel = humanizeOperatorLabel(input.sourceAgentId);
+  const targetLabel = humanizeOperatorLabel(input.targetAgentId);
+  if (input.status === "blocked") {
+    return pickUiText(
+      input.language,
+      `${targetLabel} did not finish the latest cross-session reply and needs follow-up.`,
+      `${targetLabel} 没有顺利完成最近一轮跨会话回复，当前需要跟进。`,
+    );
+  }
+  if (input.status === "active") {
+    return input.bidirectional
+      ? pickUiText(
+          input.language,
+          `${sourceLabel} and ${targetLabel} are actively exchanging messages between existing sessions.`,
+          `${sourceLabel} 和 ${targetLabel} 正在已有会话之间来回通信。`,
+        )
+      : pickUiText(
+          input.language,
+          `${sourceLabel} has sent a message into ${targetLabel}'s existing session, and the visible reply is still in progress.`,
+          `${sourceLabel} 已向 ${targetLabel} 的既有会话发出消息，当前还在等待这轮可见回复继续回来。`,
+        );
+  }
+  if (input.status === "handoff") {
+    return pickUiText(
+      input.language,
+      `${sourceLabel} has sent a message into ${targetLabel}'s existing session. The next visible reply has not returned yet.`,
+      `${sourceLabel} 已把消息投递到 ${targetLabel} 的既有会话，下一条可见回复还没有回来。`,
+    );
+  }
+  return input.bidirectional
+    ? pickUiText(
+        input.language,
+        `${targetLabel} has already replied through its existing session. The latest visible exchange is complete.`,
+        `${targetLabel} 已经通过自己的既有会话回了信，最近一轮可见通信已经完成。`,
+      )
+    : pickUiText(
+        input.language,
+        `${sourceLabel} finished the latest visible cross-session exchange with ${targetLabel}.`,
+        `${sourceLabel} 和 ${targetLabel} 最近一轮可见跨会话通信已经结束。`,
+      );
+}
+
+function collaborationInterSessionCurrentOwnerLabel(
+  currentOwnerAgentId: string,
+  language: UiLanguage = "zh",
+): string {
+  return pickUiText(
+    language,
+    `Now with ${humanizeOperatorLabel(currentOwnerAgentId)}`,
+    `当前在 ${humanizeOperatorLabel(currentOwnerAgentId)}`,
+  );
+}
+
+function buildInterSessionCollaborationTimelineSteps(input: {
+  sourceAgentId: string;
+  targetAgentId: string;
+  sourceSession?: SessionConversationListItem;
+  targetSession?: SessionConversationListItem;
+  signals: Array<{
+    sourceSessionKey: string;
+    targetSessionKey: string;
+    sourceTool?: string;
+    snippet: string;
+    at?: string;
+  }>;
+  language: UiLanguage;
+}): CollaborationTimelineStep[] {
+  const steps: CollaborationTimelineStep[] = [];
+  const firstSignal = input.signals[0];
+  if (firstSignal) {
+    steps.push({
+      id: `${firstSignal.sourceSessionKey}:${firstSignal.targetSessionKey}:send`,
+      agentId: input.sourceAgentId,
+      roleLabel: pickUiText(input.language, "Sending session", "发送会话"),
+      title: pickUiText(input.language, "Sent a cross-session message", "发起跨会话消息"),
+      detail: summarizeVisibleSessionSnippet(firstSignal.snippet, input.language, 120),
+      at: firstSignal.at ?? input.sourceSession?.latestHistoryAt ?? input.sourceSession?.lastMessageAt,
+      tone: "info",
+    });
+  }
+
+  for (const [index, signal] of input.signals.slice(1, 3).entries()) {
+    const sourceAgentId =
+      normalizeAgentIdCandidate(extractAgentIdFromSessionKey(signal.sourceSessionKey)) ?? input.sourceAgentId;
+    const isReply = normalizeLookupKey(sourceAgentId) === normalizeLookupKey(input.targetAgentId);
+    steps.push({
+      id: `${signal.sourceSessionKey}:${signal.targetSessionKey}:${index}`,
+      agentId: sourceAgentId,
+      roleLabel: pickUiText(
+        input.language,
+        isReply ? "Replying session" : "Sending session",
+        isReply ? "回复会话" : "发送会话",
+      ),
+      title: pickUiText(
+        input.language,
+        isReply ? "Replied through its existing session" : "Sent another cross-session message",
+        isReply ? "通过既有会话回信" : "继续发送跨会话消息",
+      ),
+      detail: summarizeVisibleSessionSnippet(signal.snippet, input.language, 120),
+      at: signal.at,
+      tone: index === input.signals.slice(1, 3).length - 1 ? "ok" : "info",
+    });
+  }
+
+  const latestSignal = input.signals.at(-1);
+  if (latestSignal && (!firstSignal || normalizeInlineText(latestSignal.snippet) !== normalizeInlineText(firstSignal.snippet))) {
+    const latestAgentId =
+      normalizeAgentIdCandidate(extractAgentIdFromSessionKey(latestSignal.sourceSessionKey)) ?? input.targetAgentId;
+    steps.push({
+      id: `${latestSignal.sourceSessionKey}:${latestSignal.targetSessionKey}:latest`,
+      agentId: latestAgentId,
+      roleLabel: pickUiText(input.language, "Latest visible reply", "最近可见回复"),
+      title: pickUiText(input.language, "Latest visible message", "最近可见消息"),
+      detail: summarizeVisibleSessionSnippet(latestSignal.snippet, input.language, 120),
+      at: latestSignal.at ?? input.targetSession?.latestHistoryAt ?? input.targetSession?.lastMessageAt,
+      tone: "ok",
+    });
+  }
+
+  if (steps.length === 0) {
+    steps.push({
+      id: `${input.sourceAgentId}:${input.targetAgentId}:fallback`,
+      agentId: input.targetAgentId,
+      roleLabel: pickUiText(input.language, "Receiving session", "接收会话"),
+      title: pickUiText(input.language, "Visible communication only", "仅有跨会话通信信号"),
+      detail: pickUiText(
+        input.language,
+        "The cross-session route is visible, but there is not enough recent text to summarize it yet.",
+        "当前能看到跨会话通信关系，但最近的文本还不够生成摘要。",
+      ),
+      at: pickLatestTimestamp([
+        input.sourceSession?.latestHistoryAt,
+        input.sourceSession?.lastMessageAt,
+        input.targetSession?.latestHistoryAt,
+        input.targetSession?.lastMessageAt,
+      ]),
+      tone: "warn",
+    });
+  }
+
+  return steps
+    .slice(0, 4)
+    .sort((a, b) => toSortableMs(a.at) - toSortableMs(b.at));
+}
+
+function normalizeAgentIdCandidate(value: string | undefined): string | undefined {
+  const normalized = normalizeLookupKey(value ?? "");
+  if (!normalized || normalized === "unassigned" || normalized === "未分配") return undefined;
+  return normalized;
+}
+
+function resolveCollaborationThreadStatus(card: TaskExecutionChainCard): CollaborationThreadStatus {
+  if (card.state === "blocked" || card.state === "waiting_approval" || card.state === "error") return "blocked";
+  if (card.state === "running" || card.executionChain.stage === "running") return "active";
+  if (card.executionChain.stage === "accepted") return "handoff";
+  return "completed";
+}
+
+function resolveCollaborationCurrentOwner(
+  card: TaskExecutionChainCard,
+  parentAgentId: string,
+  childAgentId: string,
+): string {
+  const status = resolveCollaborationThreadStatus(card);
+  if (status === "handoff") return childAgentId ?? parentAgentId;
+  if (status === "completed") return childAgentId ?? parentAgentId;
+  return childAgentId ?? parentAgentId;
+}
+
+function collaborationParticipantRoleLabel(
+  position: "parent" | "child",
+  language: UiLanguage = "zh",
+): string {
+  return position === "parent"
+    ? pickUiText(language, "Parent session", "父会话")
+    : pickUiText(language, "Child session", "子会话");
+}
+
+function collaborationRoleAgentLabel(
+  position: "parent" | "child",
+  agentId: string,
+  language: UiLanguage = "zh",
+): string {
+  const agentLabel = humanizeOperatorLabel(agentId);
+  return position === "parent"
+    ? pickUiText(language, `Parent ${agentLabel}`, `父会话 ${agentLabel}`)
+    : pickUiText(language, `Child ${agentLabel}`, `子会话 ${agentLabel}`);
+}
+
+function collaborationRouteLabel(
+  parentAgentId: string,
+  childAgentId: string,
+  hasChild: boolean,
+  language: UiLanguage = "zh",
+): string {
+  if (!hasChild) return collaborationRoleAgentLabel("parent", parentAgentId, language);
+  return `${collaborationRoleAgentLabel("parent", parentAgentId, language)} → ${collaborationRoleAgentLabel("child", childAgentId, language)}`;
+}
+
+function extractCollaborationTaskLabel(input: string, language: UiLanguage): string | undefined {
+  const normalized = normalizeInlineText(input);
+  if (!normalized) return undefined;
+
+  const explicitTaskMatch = /(?:任务|目标|task|objective)\s*[:：]\s*([^。；\n]+)/i.exec(normalized);
+  if (explicitTaskMatch?.[1]?.trim()) return safeTruncate(explicitTaskMatch[1].trim(), 88);
+
+  const cronTaskMatch = /^\[[^\]]+\s+([^\]\s][^\]]*?)\]\s/.exec(normalized);
+  if (cronTaskMatch?.[1]?.trim()) return safeTruncate(cronTaskMatch[1].trim(), 88);
+
+  const chineseBracketMatch = /^【([^】]+)】/.exec(normalized);
+  if (chineseBracketMatch?.[1]?.trim()) return safeTruncate(chineseBracketMatch[1].trim(), 88);
+
+  const firstClause = normalized
+    .split(/\s+[—-]\s+/)
+    .map((segment) => normalizeInlineText(segment))
+    .find((segment) => segment.length >= 4);
+  if (firstClause && !looksLikeStructuredExecutionTitle(firstClause)) return safeTruncate(firstClause, 88);
+
+  if (!looksLikeStructuredExecutionTitle(normalized)) return safeTruncate(normalized, 88);
+
+  const structuredSummary = summarizeStructuredSessionPayload(normalized, language);
+  if (structuredSummary?.trim()) return safeTruncate(structuredSummary, 88);
+
+  return undefined;
+}
+
+function deriveCollaborationTaskTitle(input: {
+  card: TaskExecutionChainCard;
+  parentSession?: SessionConversationListItem;
+  childSession?: SessionConversationListItem;
+  language: UiLanguage;
+}): string {
+  const mappedTitle = executionChainCardTitle(input.card, input.language);
+  const mappedLooksGeneric =
+    /隔离执行|关联任务|linked task|isolated execution|cron isolated run/i.test(mappedTitle) ||
+    /^(成功|失败|Succeeded|Failed)\b/.test(mappedTitle) ||
+    /(查询|成功|扫描|入选|发送|Queries|Successful|Scanned|Qualified|Sent)\s+\d+/i.test(mappedTitle);
+  if (!mappedLooksGeneric) return mappedTitle;
+
+  const candidates = [
+    input.childSession?.label,
+    input.parentSession?.label,
+    input.childSession?.taskSnippet,
+    input.parentSession?.taskSnippet,
+    input.childSession?.latestSnippet,
+    input.parentSession?.latestSnippet,
+    input.card.latestSnippet,
+    input.card.executionChain.detail,
+    input.card.taskTitle,
+  ];
+  for (const candidate of candidates) {
+    const derived = extractCollaborationTaskLabel(candidate ?? "", input.language);
+    if (derived?.trim()) return derived;
+  }
+
+  return mappedTitle;
+}
+
+function collaborationThreadStatusLabel(
+  status: CollaborationThreadStatus,
+  language: UiLanguage = "zh",
+): string {
+  if (status === "active") return pickUiText(language, "In progress", "进行中");
+  if (status === "handoff") return pickUiText(language, "Waiting handoff", "等待交接");
+  if (status === "blocked") return pickUiText(language, "Blocked", "卡住");
+  return pickUiText(language, "Completed", "已完成");
+}
+
+function collaborationStatusRank(status: CollaborationThreadStatus): number {
+  if (status === "active") return 4;
+  if (status === "blocked") return 3;
+  if (status === "handoff") return 2;
+  return 1;
+}
+
+function collaborationThreadSummary(input: {
+  card: TaskExecutionChainCard;
+  status: CollaborationThreadStatus;
+  parentAgentId: string;
+  childAgentId: string;
+  language: UiLanguage;
+}): string {
+  const parentLabel = collaborationRoleAgentLabel("parent", input.parentAgentId, input.language);
+  const childLabel = collaborationRoleAgentLabel("child", input.childAgentId, input.language);
+  if (input.status === "blocked") {
+    if (input.card.state === "waiting_approval") {
+      return pickUiText(
+        input.language,
+        `${childLabel} is waiting for approval before the handoff can continue.`,
+        `${childLabel} 正在等待审批，这条交接要等这一段通过后才能继续。`,
+      );
+    }
+    if (input.card.state === "error") {
+      return pickUiText(
+        input.language,
+        `${childLabel} hit an error after the latest handoff.`,
+        `${childLabel} 在最近一次交接后出现了错误。`,
+      );
+    }
+    return pickUiText(
+      input.language,
+      `${childLabel} is blocked and needs follow-up before the thread can move again.`,
+      `${childLabel} 当前卡住了，需要先跟进处理，这条协作线程才能继续。`,
+    );
+  }
+  if (input.status === "active") {
+    if (normalizeLookupKey(input.parentAgentId) !== normalizeLookupKey(input.childAgentId)) {
+      return pickUiText(
+        input.language,
+        `${childLabel} is working after ${parentLabel} handed the task over.`,
+        `${childLabel} 正在继续执行，前一步由 ${parentLabel} 完成交接。`,
+      );
+    }
+    return pickUiText(
+      input.language,
+      `${childLabel} is continuing the isolated run after ${parentLabel} opened it.`,
+      `${childLabel} 正在继续执行，前一步由 ${parentLabel} 在同一智能体里发起。`,
+    );
+  }
+  if (input.status === "handoff") {
+    if (normalizeLookupKey(input.parentAgentId) !== normalizeLookupKey(input.childAgentId)) {
+      return pickUiText(
+        input.language,
+        `${parentLabel} handed the task to ${childLabel}. The next visible reply has not arrived yet.`,
+        `${parentLabel} 已把任务交给 ${childLabel}，下一条可见回复还没有回来。`,
+      );
+    }
+    return pickUiText(
+      input.language,
+      `${parentLabel} opened a child run in the same agent. The next visible reply is still pending.`,
+      `${parentLabel} 已在同一智能体里发起子会话，但下一条可见回复还没出现。`,
+    );
+  }
+  if (normalizeLookupKey(input.parentAgentId) !== normalizeLookupKey(input.childAgentId)) {
+    return pickUiText(
+      input.language,
+      `${childLabel} finished the latest visible handoff from ${parentLabel}.`,
+      `${childLabel} 已完成最近一轮由 ${parentLabel} 交接过来的工作。`,
+    );
+  }
+  return pickUiText(
+    input.language,
+    `${childLabel} finished the latest visible isolated run after ${parentLabel} handed it off.`,
+    `${childLabel} 已完成最近一轮由 ${parentLabel} 发起的隔离执行。`,
+  );
+}
+
+function buildCollaborationTimelineSteps(input: {
+  card: TaskExecutionChainCard;
+  parentAgentId: string;
+  childAgentId: string;
+  parentSession?: SessionConversationListItem;
+  childSession?: SessionConversationListItem;
+  language: UiLanguage;
+}): CollaborationTimelineStep[] {
+  const steps: CollaborationTimelineStep[] = [];
+  const parentLabel = collaborationRoleAgentLabel("parent", input.parentAgentId, input.language);
+  const childLabel = collaborationRoleAgentLabel("child", input.childAgentId, input.language);
+  const chain = input.card.executionChain;
+
+  if (chain.accepted) {
+    steps.push({
+      id: `${input.card.sessionKey}:accepted`,
+      agentId: input.parentAgentId,
+      roleLabel: collaborationParticipantRoleLabel("parent", input.language),
+      title: pickUiText(input.language, "Parent accepted work", "父会话接到任务"),
+      detail: pickUiText(
+        input.language,
+        `${parentLabel} accepted the work in the parent session.`,
+        `${parentLabel} 在父会话里接下了这件事。`,
+      ),
+      at: chain.acceptedAt ?? input.parentSession?.latestHistoryAt ?? input.parentSession?.lastMessageAt,
+      tone: "info",
+    });
+  }
+
+  if (chain.spawned) {
+    steps.push({
+      id: `${input.card.sessionKey}:spawned`,
+      agentId: input.parentAgentId,
+      roleLabel: collaborationParticipantRoleLabel("parent", input.language),
+      title: pickUiText(input.language, "Parent opened child session", "父会话发起子会话"),
+      detail: normalizeLookupKey(input.parentAgentId) === normalizeLookupKey(input.childAgentId)
+        ? pickUiText(
+            input.language,
+            `${parentLabel} opened a child run in the same agent.`,
+            `${parentLabel} 在同一智能体里开了一条子会话来继续执行。`,
+          )
+        : pickUiText(
+            input.language,
+            `${parentLabel} handed the work to ${childLabel}.`,
+            `${parentLabel} 把这件事交给了 ${childLabel}。`,
+          ),
+      at: chain.spawnedAt ?? input.childSession?.latestHistoryAt ?? input.childSession?.lastMessageAt,
+      tone: "info",
+    });
+  }
+
+  if ((input.parentSession?.taskSnippet ?? input.parentSession?.latestSnippet)?.trim()) {
+    steps.push({
+      id: `${input.card.sessionKey}:parent-note`,
+      agentId: input.parentAgentId,
+      roleLabel: collaborationParticipantRoleLabel("parent", input.language),
+      title: pickUiText(input.language, "Parent session note", "父会话说明"),
+      detail: summarizeVisibleSessionSnippet(
+        input.parentSession?.taskSnippet ?? input.parentSession?.latestSnippet ?? "",
+        input.language,
+        120,
+      ),
+      at: input.parentSession.latestHistoryAt ?? input.parentSession.lastMessageAt,
+      tone: "ok",
+    });
+  }
+
+  if (input.childSession?.latestSnippet?.trim()) {
+    steps.push({
+      id: `${input.card.sessionKey}:child-note`,
+      agentId: input.childAgentId,
+      roleLabel: collaborationParticipantRoleLabel("child", input.language),
+      title: pickUiText(input.language, "Child session reply", "子会话最近回复"),
+      detail: summarizeVisibleSessionSnippet(input.childSession.latestSnippet, input.language, 120),
+      at: input.childSession.latestHistoryAt ?? input.childSession.lastMessageAt,
+      tone: input.card.state === "blocked" || input.card.state === "error" || input.card.state === "waiting_approval" ? "blocked" : "ok",
+    });
+  }
+
+  if (steps.length === 0) {
+    steps.push({
+      id: `${input.card.sessionKey}:fallback`,
+      agentId: input.childAgentId,
+      roleLabel: collaborationParticipantRoleLabel(
+        normalizeLookupKey(input.parentAgentId) === normalizeLookupKey(input.childAgentId) ? "parent" : "child",
+        input.language,
+      ),
+      title: pickUiText(input.language, "Visible chain only", "仅有执行链信号"),
+      detail: pickUiText(
+        input.language,
+        "The handoff relationship is visible, but there is not enough recent session text to summarize it yet.",
+        "当前能看到交接关系，但最近的会话文本还不够生成摘要。",
+      ),
+      at: input.card.latestAt,
+      tone: "warn",
+    });
+  }
+
+  return steps
+    .slice(0, 4)
+    .sort((a, b) => toSortableMs(a.at) - toSortableMs(b.at));
+}
+
+function renderCollaborationThreadCards(
+  cards: CollaborationThreadCard[],
+  language: UiLanguage = "zh",
+): string {
+  if (cards.length === 0) {
+    return `<div class="empty-state">${escapeHtml(
+      pickUiText(
+        language,
+        "No collaboration threads are visible yet. They will appear once parent-child relays or cross-session messages show up.",
+        "当前还没有可见的协作线程。父子接力或跨会话消息出现后，这里就会开始显示。",
+      ),
+    )}</div>`;
+  }
+
+  return `<div class="collaboration-thread-list">${cards
+    .map((card) => {
+      const participantAvatars = card.participants
+        .map((participant, index) => {
+          const avatar = `<div class="collaboration-participant">
+            <div class="agent-avatar collaboration-avatar${participant.current ? " is-current" : ""}" style="--agent-accent:${escapeHtml(participant.identity.accent)};" data-agent-id="${escapeHtml(participant.agentId)}" data-animal="${escapeHtml(participant.identity.animal)}" aria-label="${escapeHtml(participant.label)}">
+              <div class="agent-stage" aria-hidden="true">
+                <canvas class="agent-pixel-canvas" width="224" height="224"></canvas>
+              </div>
+            </div>
+            <div class="collaboration-participant-label">${escapeHtml(participant.roleLabel)}</div>
+          </div>`;
+          const arrow =
+            index < card.participants.length - 1
+              ? `<span class="collaboration-route-arrow" aria-hidden="true">${escapeHtml(card.routeJoiner)}</span>`
+              : "";
+          return `${avatar}${arrow}`;
+        })
+        .join("");
+      const timelineHtml = card.timeline
+        .map((step) => {
+          const identity = deriveAgentAnimalIdentity(step.agentId);
+          return `<li class="collaboration-timeline-step">
+            <div class="collaboration-agent-pill" style="--agent-accent:${escapeHtml(identity.accent)};">
+              <span class="collaboration-agent-pill-dot"></span>
+              <strong>${escapeHtml(step.roleLabel ? `${step.roleLabel} · ${humanizeOperatorLabel(step.agentId)}` : humanizeOperatorLabel(step.agentId))}</strong>
+            </div>
+            <div class="collaboration-step-copy">
+              <div class="collaboration-step-head">
+                <strong>${escapeHtml(step.title)}</strong>
+                <span>${escapeHtml(step.at ? formatTimeAgoFromNow(step.at, language) : pickUiText(language, "time unavailable", "时间未知"))}</span>
+              </div>
+              <div class="meta">${escapeHtml(step.detail)}</div>
+            </div>
+          </li>`;
+        })
+        .join("");
+      const technicalDetails = [
+        card.parentSessionKey
+          ? {
+              label:
+                card.kind === "inter_session"
+                  ? pickUiText(language, "Sending session", "发送会话")
+                  : pickUiText(language, "Parent session", "父会话"),
+              value: card.parentSessionKey,
+            }
+          : undefined,
+        card.childSessionKey
+          ? {
+              label:
+                card.kind === "inter_session"
+                  ? pickUiText(language, "Receiving session", "接收会话")
+                  : pickUiText(language, "Child session", "子会话"),
+              value: card.childSessionKey,
+            }
+          : undefined,
+      ]
+        .filter((item): item is { label: string; value: string } => Boolean(item?.value))
+        .filter((item, index, values) => values.findIndex((entry) => entry.value === item.value) === index)
+        .map((item) => `<li>${escapeHtml(item.label)}：<code>${escapeHtml(item.value)}</code></li>`)
+        .join("");
+      const foldedRunsList =
+        card.aggregateCount > 1
+          ? `<ul class="story-list collaboration-folded-list">${card.aggregateItems
+              .slice(0, 6)
+              .map(
+                (item) =>
+                  `<li><a href="${escapeHtml(item.sessionHref)}"><code>${escapeHtml(item.sessionKey)}</code></a> · ${escapeHtml(
+                    item.latestAt
+                      ? formatTimeAgoFromNow(item.latestAt, language)
+                      : pickUiText(language, "time unavailable", "时间未知"),
+                  )}</li>`,
+              )
+              .join("")}${
+                card.aggregateItems.length > 6
+                  ? `<li>${escapeHtml(
+                      pickUiText(
+                        language,
+                        `${card.aggregateItems.length - 6} more runs are folded here.`,
+                        `其余 ${card.aggregateItems.length - 6} 条相近协作也已经折叠在这里。`,
+                      ),
+                    )}</li>`
+                  : ""
+              }</ul>`
+          : "";
+      return `<details class="card collaboration-thread-card" data-collab-card data-collab-state="${escapeHtml(
+        card.status,
+      )}" data-collab-multi-agent="${card.multiAgent ? "1" : "0"}" data-collab-main-dispatched="${card.mainDispatched ? "1" : "0"}">
+        <summary class="collaboration-thread-summary">
+          <div class="collaboration-thread-head">
+            <div class="collaboration-route-avatars">${participantAvatars}</div>
+            <div class="collaboration-thread-copy">
+              <strong>${escapeHtml(card.taskTitle)}</strong>
+              <div class="meta">${escapeHtml(card.routeTitle)} · ${escapeHtml(card.latestAtLabel)}</div>
+            </div>
+            <div class="collaboration-thread-badges">
+              ${badge("idle", card.kindBadge)}
+              ${badge(card.status === "completed" ? "ok" : card.status === "blocked" ? "warn" : "info", card.statusBadge)}
+              ${
+                card.aggregateCount > 1
+                  ? badge("idle", pickUiText(language, `${card.aggregateCount} runs`, `${card.aggregateCount} 条`))
+                  : ""
+              }
+              <span class="collaboration-current-owner">${escapeHtml(card.currentOwnerLabel)}</span>
+            </div>
+          </div>
+          <div class="collaboration-thread-teaser">
+            <div class="meta">${escapeHtml(card.summary)}</div>
+            <div class="collaboration-latest-snippet">${escapeHtml(card.latestSnippet)}</div>
+          </div>
+        </summary>
+        <div class="collaboration-thread-body">
+          <ol class="collaboration-timeline">${timelineHtml}</ol>
+          ${
+            card.aggregateCount > 1
+              ? `<div class="meta collaboration-folded-note">${escapeHtml(
+                  card.kind === "inter_session"
+                    ? pickUiText(
+                        language,
+                        `${card.aggregateCount} similar cross-session exchanges are folded into this card. The newest timeline stays visible here.`,
+                        `这张卡里折叠了 ${card.aggregateCount} 条相近的跨会话通信，当前保留的是最新一条时间线。`,
+                      )
+                    : pickUiText(
+                        language,
+                        `${card.aggregateCount} similar parent-child relays are folded into this card. The newest timeline stays visible here.`,
+                        `这张卡里折叠了 ${card.aggregateCount} 条相近的父子会话接力，当前保留的是最新一条时间线。`,
+                      ),
+                )}</div>`
+              : ""
+          }
+          <div class="collaboration-thread-foot">
+            <div class="meta">${escapeHtml(card.sourceLabel)}</div>
+            <div class="collaboration-thread-actions">
+              <a class="btn" href="${escapeHtml(card.sessionHref)}">${escapeHtml(
+                pickUiText(language, "Open session", "查看会话"),
+              )}</a>
+              ${
+                card.taskHref
+                  ? `<a class="btn" href="${escapeHtml(card.taskHref)}">${escapeHtml(
+                      pickUiText(language, "Open task", "查看任务"),
+                    )}</a>`
+                  : ""
+              }
+            </div>
+          </div>
+          <details class="compact-table-details collaboration-technical-details">
+            <summary>${escapeHtml(pickUiText(language, "Technical details", "技术细节"))}</summary>
+            <div class="fold-body">
+              <ul class="story-list">${technicalDetails}</ul>
+              ${foldedRunsList}
+            </div>
+          </details>
+        </div>
+      </details>`;
+    })
+    .join("")}</div>`;
+}
+
+function renderOfficeCards(
+  cards: OfficeSpaceCard[],
+  avatarPreferences: Awaited<ReturnType<typeof loadAvatarPreferences>>["preferences"],
+  language: UiLanguage = "zh",
+): string {
   if (cards.length === 0) {
     return `<div class="empty-state">${escapeHtml(
       pickUiText(language, "No staff roster signal yet. It will appear after config or runtime data is connected.", "暂无助手名录信号。连接配置或运行态后会显示。"),
@@ -10935,11 +13692,25 @@ function renderOfficeCards(cards: OfficeSpaceCard[], language: UiLanguage = "zh"
           : `<div class="meta">当前重点：</div><ul class="office-focus">${card.focusItems
               .map((item) => `<li>${escapeHtml(item)}</li>`)
               .join("")}</ul>`;
-      const avatar = `<div class="agent-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}">
-        <div class="agent-stage" aria-hidden="true">
-          <canvas class="agent-pixel-canvas" width="224" height="160"></canvas>
-        </div>
+      const effective = resolveEffectiveAvatar({
+        agentId: card.agentId,
+        agentAnimal: card.identity.animal,
+        preferences: avatarPreferences,
+      });
+      const effectiveAnimal = effective.mode === "pixel" ? effective.animal : card.identity.animal;
+      const stageInner =
+        effective.mode === "custom"
+          ? `<img class="agent-avatar-img" src="/avatars/${escapeHtml(effective.image)}" alt="${escapeHtml(card.agentId)}" loading="lazy" />`
+          : `<canvas class="agent-pixel-canvas" width="224" height="160"></canvas>`;
+      const avatar = `<div class="agent-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(effectiveAnimal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
+        <div class="agent-stage" aria-hidden="true">${stageInner}</div>
         <div class="agent-animal-label">${escapeHtml(animalLabel(card.identity.animal, language))}</div>
+        <button type="button" class="avatar-edit-btn" aria-label="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}" title="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 20h4l10.6-10.6a2.2 2.2 0 0 0 0-3.1l-0.9-0.9a2.2 2.2 0 0 0-3.1 0L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M13.8 6.2l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>`;
       return `<article class="office-card">
         <div class="office-head">
@@ -11166,6 +13937,66 @@ function renderNativeMotionScript(language: UiLanguage = "zh"): string {
 </script>`;
 }
 
+function renderCollaborationFilterScript(language: UiLanguage = "zh"): string {
+  return `<script>
+(() => {
+  const roots = Array.from(document.querySelectorAll('[data-collab-root]'));
+  if (roots.length === 0) return;
+
+  const copy = {
+    all: '${escapeHtml(pickUiText(language, "Showing all visible threads", "当前显示全部可见线程"))}',
+    active: '${escapeHtml(pickUiText(language, "Showing in-progress collaboration", "当前显示进行中的协作"))}',
+    blocked: '${escapeHtml(pickUiText(language, "Showing blocked collaboration", "当前显示卡住的协作"))}',
+    completed: '${escapeHtml(pickUiText(language, "Showing completed collaboration", "当前显示已完成的协作"))}',
+    multiAgent: '${escapeHtml(pickUiText(language, "Showing multi-agent collaboration only", "当前只看多智能体协作"))}',
+    mainDispatched: '${escapeHtml(pickUiText(language, "Showing collaboration dispatched by Main", "当前只看 Main 派发的协作"))}',
+  };
+
+  roots.forEach((root) => {
+    const buttons = Array.from(root.querySelectorAll('[data-collab-filter]'));
+    const cards = Array.from(root.querySelectorAll('[data-collab-card]'));
+    const stateNode = root.querySelector('[data-collab-filter-state]');
+    const apply = (mode) => {
+      buttons.forEach((button) => button.classList.toggle('active', (button.dataset.collabFilter || 'all') === mode));
+      cards.forEach((card) => {
+        const state = card.dataset.collabState || 'completed';
+        const multiAgent = card.dataset.collabMultiAgent === '1';
+        const mainDispatched = card.dataset.collabMainDispatched === '1';
+        const matches =
+          mode === 'all' ||
+          (mode === 'active' && (state === 'active' || state === 'handoff')) ||
+          (mode === 'blocked' && state === 'blocked') ||
+          (mode === 'completed' && state === 'completed') ||
+          (mode === 'multi-agent' && multiAgent) ||
+          (mode === 'main-dispatched' && mainDispatched);
+        card.hidden = !matches;
+      });
+      if (stateNode) {
+        stateNode.textContent =
+          mode === 'all'
+            ? copy.all
+            : mode === 'active'
+              ? copy.active
+              : mode === 'blocked'
+                ? copy.blocked
+                : mode === 'completed'
+                  ? copy.completed
+                  : mode === 'multi-agent'
+                    ? copy.multiAgent
+                    : copy.mainDispatched;
+      }
+    };
+
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => apply(button.dataset.collabFilter || 'all'));
+    });
+
+    apply('all');
+  });
+})();
+</script>`;
+}
+
 function renderQuotaResetScript(): string {
   return `<script>
 (() => {
@@ -11206,6 +14037,737 @@ function renderQuotaResetScript(): string {
     const raw = node.getAttribute('data-quota-reset-at') || '';
     const windowLabel = node.getAttribute('data-quota-window') || '';
     node.textContent = formatReset(raw, windowLabel);
+  });
+})();
+</script>`;
+}
+
+function renderHeaderControlsScript(language: UiLanguage = "zh"): string {
+  const t = (en: string, zh: string): string => pickUiText(language, en, zh);
+  return `<script>
+(() => {
+  const themeKey = 'openclaw:theme';
+  const restoreKey = 'openclaw:refresh-state:v1:' + location.pathname + location.search;
+
+  const applyTheme = (theme) => {
+    const normalized = (theme === 'dark' || theme === 'light') ? theme : 'light';
+    document.documentElement.dataset.theme = normalized;
+    try { window.localStorage.setItem(themeKey, normalized); } catch {}
+  };
+
+  const setupThemeToggle = () => {
+    const themeToggle = document.getElementById('theme-toggle');
+    if (themeToggle) {
+      themeToggle.addEventListener('click', () => {
+        const current = (document.documentElement.dataset.theme || 'light').trim().toLowerCase();
+        applyTheme(current === 'dark' ? 'light' : 'dark');
+      });
+    }
+  };
+
+  // 确保在DOM加载完成后设置主题切换
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupThemeToggle);
+  } else {
+    setupThemeToggle();
+  }
+
+  const setupRefreshButton = () => {
+    const refreshButton = document.getElementById('data-refresh');
+    if (refreshButton) {
+      refreshButton.addEventListener('click', () => {
+        try {
+          refreshButton.setAttribute('aria-busy', 'true');
+        } catch {}
+        try { window.sessionStorage.setItem(restoreKey, JSON.stringify(captureState())); } catch {}
+        window.setTimeout(() => location.reload(), 60);
+      });
+    }
+  };
+
+  const captureState = () => {
+    const inputs = Array.from(document.querySelectorAll('input, textarea, select'));
+    const items = inputs.map((node) => {
+      const el = node;
+      const name = el.getAttribute('name') || '';
+      const id = el.getAttribute('id') || '';
+      const key = id ? ('#' + id) : (name ? (el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]') : '');
+      if (!key) return null;
+      const type = (el instanceof HTMLInputElement ? (el.type || '').toLowerCase() : '');
+      if (el instanceof HTMLInputElement && (type === 'checkbox' || type === 'radio')) {
+        return { key, kind: 'checked', value: Boolean(el.checked) };
+      }
+      const value = (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) ? el.value : '';
+      const selectionStart = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionStart : null;
+      const selectionEnd = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionEnd : null;
+      return { key, kind: 'value', value, selectionStart, selectionEnd };
+    }).filter(Boolean);
+
+    const focused = document.activeElement;
+    const focusedKey = (focused && focused instanceof HTMLElement)
+      ? (focused.id ? ('#' + focused.id) : (focused.getAttribute('name') ? (focused.tagName.toLowerCase() + '[name="' + focused.getAttribute('name').replace(/"/g, '\\"') + '"]') : ''))
+      : '';
+
+    return {
+      at: Date.now(),
+      scrollY: window.scrollY || 0,
+      focusedKey,
+      items,
+    };
+  };
+
+  const restoreState = (state) => {
+    if (!state || typeof state !== 'object') return;
+    const items = Array.isArray(state.items) ? state.items : [];
+    items.forEach((item) => {
+      if (!item || typeof item !== 'object') return;
+      const key = String(item.key || '');
+      if (!key) return;
+      const el = document.querySelector(key);
+      if (!el) return;
+      const kind = String(item.kind || '');
+      if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio') && kind === 'checked') {
+        el.checked = Boolean(item.value);
+        return;
+      }
+      if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) && kind === 'value') {
+        el.value = String(item.value ?? '');
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          const ss = Number(item.selectionStart);
+          const se = Number(item.selectionEnd);
+          if (Number.isFinite(ss) && Number.isFinite(se)) {
+            try { el.setSelectionRange(ss, se); } catch {}
+          }
+        }
+      }
+    });
+
+    if (Number.isFinite(Number(state.scrollY))) {
+      window.scrollTo({ top: Number(state.scrollY), left: 0, behavior: 'instant' });
+    }
+    if (state.focusedKey && typeof state.focusedKey === 'string') {
+      const target = document.querySelector(state.focusedKey);
+      if (target && target instanceof HTMLElement) {
+        try { target.focus(); } catch {}
+      }
+    }
+  };
+
+  // 确保在DOM加载完成后设置刷新按钮
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupRefreshButton);
+  } else {
+    setupRefreshButton();
+  }
+
+  const bootRestore = () => {
+    let raw = '';
+    try { raw = window.sessionStorage.getItem(restoreKey) || ''; } catch {}
+    if (!raw) return;
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch { parsed = null; }
+    try { window.sessionStorage.removeItem(restoreKey); } catch {}
+    if (!parsed) return;
+    window.requestAnimationFrame(() => {
+      restoreState(parsed);
+    });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootRestore, { once: true });
+  } else {
+    bootRestore();
+  }
+})();
+</script>`;
+}
+
+function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEnabled: boolean = false): string {
+  const labels = {
+    pixel: pickUiText(language, "Pixel", "像素画"),
+    custom: pickUiText(language, "Custom", "自定义"),
+    agentConfig: pickUiText(language, "Current agent config", "当前Agent配置"),
+    editAvatar: pickUiText(language, "Edit avatar", "编辑头像"),
+    upload: pickUiText(language, "Upload avatar", "上传头像"),
+    apply: pickUiText(language, "Apply", "应用"),
+    delete: pickUiText(language, "Delete", "删除"),
+    recrop: pickUiText(language, "Edit", "编辑"),
+    loading: pickUiText(language, "Loading…", "加载中…"),
+    emptyUploads: pickUiText(language, "No uploaded avatars yet.", "还没有上传头像。"),
+    chooseFile: pickUiText(language, "Choose file", "选择文件"),
+    saving: pickUiText(language, "Saving…", "保存中…"),
+    save: pickUiText(language, "Save", "保存"),
+    saveOk: pickUiText(language, "Saved successfully", "保存成功"),
+    failed: pickUiText(language, "Operation failed.", "操作失败。"),
+  };
+  const animalLabels: Record<string, string> = {
+    robot: animalLabel("robot", language),
+    lion: animalLabel("lion", language),
+    tiger: animalLabel("tiger", language),
+    panda: animalLabel("panda", language),
+    monkey: animalLabel("monkey", language),
+    dolphin: animalLabel("dolphin", language),
+    owl: animalLabel("owl", language),
+    fox: animalLabel("fox", language),
+    bear: animalLabel("bear", language),
+    eagle: animalLabel("eagle", language),
+    otter: animalLabel("otter", language),
+    rooster: animalLabel("rooster", language),
+  };
+  const animals = Object.keys(animalLabels);
+  return `<script>
+(() => {
+  const L = ${JSON.stringify(labels)};
+  const ANIMALS = ${JSON.stringify(animals)};
+  const ANIMAL_LABELS = ${JSON.stringify(animalLabels)};
+  const IMPORT_MUTATION_ENABLED = ${JSON.stringify(importMutationEnabled)};
+  const avatarPrefKey = (agentId) => 'openclaw:avatar-pref:' + agentId;
+  const readAvatarPref = (agentId) => {
+    if (!agentId) return null;
+    try {
+      const raw = window.localStorage.getItem(avatarPrefKey(agentId)) || '';
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+  const writeAvatarPref = (agentId, pref) => {
+    if (!agentId || !pref) return;
+    try { window.localStorage.setItem(avatarPrefKey(agentId), JSON.stringify(pref)); } catch {}
+  };
+  const tokenKey = () => 'openclaw:local-api-token';
+  const readToken = () => {
+    try { return window.localStorage.getItem(tokenKey()) || ''; } catch { return ''; }
+  };
+  const writeToken = (token) => {
+    try { window.localStorage.setItem(tokenKey(), token || ''); } catch {}
+  };
+  const promptForToken = () => {
+    const token = window.prompt('服务器安全限制，请输入 LOCAL_API_TOKEN（详见.env）');
+    if (token && token.trim()) {
+      writeToken(token.trim());
+      return token.trim();
+    }
+    return null;
+  };
+  const saveAvatarToServer = async (agentId, pref) => {
+    if (!IMPORT_MUTATION_ENABLED || !agentId || !pref) return false;
+    let token = readToken();
+    if (!token) {
+      token = promptForToken();
+      if (!token) return false;
+    }
+    try {
+      const res = await fetch('/api/avatar/preferences', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-local-token': token,
+        },
+        body: JSON.stringify({ agentId, mode: pref.mode, animal: pref.animal, image: pref.image }),
+      });
+      if (res.status === 401) {
+        // Token invalid, prompt again
+        token = promptForToken();
+        if (!token) return false;
+        const retryRes = await fetch('/api/avatar/preferences', {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-local-token': token,
+          },
+          body: JSON.stringify({ agentId, mode: pref.mode, animal: pref.animal, image: pref.image }),
+        });
+        return retryRes.ok;
+      }
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+  const loadAvatarFromServer = async (agentId) => {
+    if (!IMPORT_MUTATION_ENABLED || !agentId) return null;
+    try {
+      // GET request does not require token
+      const res = await fetch('/api/avatar/preferences?agentId=' + encodeURIComponent(agentId));
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data && data.preference ? data.preference : null;
+    } catch {
+      return null;
+    }
+  };
+  const uploadAvatarToServer = async (dataUrl, fileNameHint) => {
+    if (!IMPORT_MUTATION_ENABLED || !dataUrl) return null;
+    let token = readToken();
+    if (!token) {
+      token = promptForToken();
+      if (!token) return null;
+    }
+    try {
+      const res = await fetch('/api/avatar/uploads', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-local-token': token,
+        },
+        body: JSON.stringify({ dataUrl, fileName: fileNameHint }),
+      });
+      if (res.status === 401) {
+        // Token invalid, prompt again
+        token = promptForToken();
+        if (!token) return null;
+        const retryRes = await fetch('/api/avatar/uploads', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-local-token': token,
+          },
+          body: JSON.stringify({ dataUrl, fileName: fileNameHint }),
+        });
+        if (!retryRes.ok) return null;
+        const data = await retryRes.json();
+        return data && data.upload ? data.upload : null;
+      }
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data && data.upload ? data.upload : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const q = (sel, root) => (root || document).querySelector(sel);
+  const qa = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+  const ensureCanvas = (avatarEl, canvasSize) => {
+    const stage = q('.agent-stage', avatarEl);
+    if (!stage) return null;
+    let canvas = q('canvas.agent-pixel-canvas', stage);
+    if (!canvas) {
+      stage.innerHTML = '<canvas class="agent-pixel-canvas" width="' + canvasSize + '" height="' + canvasSize + '"></canvas>';
+      canvas = q('canvas.agent-pixel-canvas', stage);
+    }
+    return canvas;
+  };
+
+  const renderStaticPixel = (avatarEl) => {
+    const api = window.__openclawPixelAvatar;
+    if (api && typeof api.renderElement === 'function') {
+      api.renderElement(avatarEl);
+      return true;
+    }
+    return false;
+  };
+
+  const applyAvatarDom = (avatarEl, next) => {
+    const stage = q('.agent-stage', avatarEl);
+    if (!stage) return;
+    if (next.mode === 'custom') {
+      const src = next.imageDataUrl ? next.imageDataUrl : ('/avatars/' + esc(next.image));
+      stage.innerHTML = '<img class="agent-avatar-img" src="' + src + '" alt="" loading="lazy" />';
+      avatarEl.dataset.avatarMode = 'custom';
+      avatarEl.dataset.avatarImage = next.image || '';
+      if (window.__openclawPixelAvatar && typeof window.__openclawPixelAvatar.updateAvatar === 'function') {
+        window.__openclawPixelAvatar.updateAvatar(avatarEl, next);
+      }
+      return;
+    }
+    const canvasSize = avatarEl.classList.contains('agent-avatar') ? 224 : 256;
+    ensureCanvas(avatarEl, canvasSize);
+    avatarEl.dataset.avatarMode = 'pixel';
+    avatarEl.dataset.avatarImage = '';
+    avatarEl.dataset.animal = next.animal;
+    // 使用 updateAvatar 更新动画循环中的 actor，确保头像持续更新
+    if (window.__openclawPixelAvatar && typeof window.__openclawPixelAvatar.updateAvatar === 'function') {
+      window.__openclawPixelAvatar.updateAvatar(avatarEl, next);
+    }
+    // 立即渲染一次，确保头像立即显示
+    renderStaticPixel(avatarEl);
+  };
+
+  const openModal = (avatarEl) => {
+    const agentId = (avatarEl.dataset.agentId || '').trim();
+    const displayName = (q('h3', avatarEl.closest('.staff-brief-card') || document.body)?.textContent || agentId || 'Agent').trim();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'avatar-modal-backdrop';
+    backdrop.innerHTML = \`
+      <div class="avatar-modal" role="dialog" aria-modal="true" aria-label="\${esc(L.editAvatar)}">
+        <div class="avatar-modal-head">
+          <div class="avatar-modal-title">\${esc(displayName)} · \${esc(L.editAvatar)}</div>
+          <div class="avatar-modal-actions">
+            <button type="button" class="avatar-modal-close" aria-label="Close" title="Close">X</button>
+          </div>
+        </div>
+        <div class="avatar-modal-body">
+          <div class="avatar-preview">
+            <div class="agent-stage"></div>
+            <div class="meta">\${esc(agentId)}</div>
+          </div>
+          <div class="avatar-panel">
+            <div class="avatar-tabs">
+              <button type="button" class="avatar-tab active" data-tab="pixel">\${esc(L.pixel)}</button>
+              <button type="button" class="avatar-tab" data-tab="custom">\${esc(L.custom)}</button>
+            </div>
+            \${''}
+            <div class="avatar-panel-body"></div>
+          </div>
+        </div>
+      </div>\`;
+    document.body.appendChild(backdrop);
+
+    const modal = q('.avatar-modal', backdrop);
+    const close = () => { try { backdrop.remove(); } catch {} };
+    q('.avatar-modal-close', backdrop)?.addEventListener('click', close);
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); }, { once: true });
+
+    const previewStage = q('.avatar-preview .agent-stage', backdrop);
+    const syncPreview = () => {
+      if (!previewStage) return;
+      previewStage.innerHTML = '';
+      const clone = avatarEl.cloneNode(true);
+      clone.classList.remove('staff-avatar');
+      clone.classList.remove('agent-avatar');
+      const stage = q('.agent-stage', clone);
+      if (stage) {
+        stage.style.borderRadius = '14px';
+      }
+      previewStage.appendChild(clone);
+      if (clone.dataset.avatarMode !== 'custom') {
+        // Ensure a canvas exists for preview, then render once.
+        const size = 200;
+        const stageEl = q('.agent-stage', clone);
+        if (stageEl) stageEl.innerHTML = '<canvas class="agent-pixel-canvas" width="' + size + '" height="' + size + '"></canvas>';
+        renderStaticPixel(clone);
+      }
+    };
+
+    const panelBody = q('.avatar-panel-body', backdrop);
+    const setBusy = (busy) => {
+      modal?.classList.toggle('is-busy', Boolean(busy));
+    };
+
+
+
+    const renderPixelTab = () => {
+      if (!panelBody) return;
+      panelBody.innerHTML = \`
+        <div class="avatar-grid">
+          <button type="button" class="avatar-choice" data-pixel="agent" data-apply="1" title="\${esc(L.agentConfig)}">
+            <div class="meta">\${esc(L.agentConfig)}</div>
+          </button>
+          \${ANIMALS.map((a) => \`
+            <button type="button" class="avatar-choice" data-pixel="\${esc(a)}" data-apply="1" title="\${esc(ANIMAL_LABELS[a] || a)}">
+              <div class="agent-stage" style="width:70px; aspect-ratio:1/1; border-radius:14px; overflow:hidden; display:grid; place-items:center;">
+                <canvas class="agent-pixel-canvas" width="96" height="96"></canvas>
+              </div>
+              <div class="avatar-choice-label">\${esc(ANIMAL_LABELS[a] || a)}</div>
+            </button>\`).join('')}
+        </div>\`;
+
+      // Render tiny previews.
+      qa('.avatar-choice[data-pixel]', panelBody).forEach((btn) => {
+        const animal = btn.getAttribute('data-pixel');
+        if (!animal || animal === 'agent') return;
+        const canvas = q('canvas.agent-pixel-canvas', btn);
+        const api = window.__openclawPixelAvatar;
+        if (canvas && api && typeof api.renderCanvas === 'function') {
+          api.renderCanvas(canvas, animal, getComputedStyle(avatarEl).getPropertyValue('--agent-accent').trim());
+        }
+      });
+
+      qa('.avatar-choice[data-pixel]', panelBody).forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const value = String(btn.getAttribute('data-pixel') || '');
+          setBusy(true);
+          try {
+            if (value === 'agent') {
+              // Revert to server-provided animal.
+              const baseAnimal = (avatarEl.getAttribute('data-animal') || avatarEl.dataset.animal || 'default').trim().toLowerCase();
+              applyAvatarDom(avatarEl, { mode: 'pixel', animal: baseAnimal });
+              writeAvatarPref(agentId, { mode: 'pixel', animal: baseAnimal });
+              // Only save to server when IMPORT_MUTATION_ENABLED is true
+              if (IMPORT_MUTATION_ENABLED) {
+                await saveAvatarToServer(agentId, { mode: 'pixel', animal: baseAnimal });
+              }
+              syncPreview();
+              return;
+            }
+            const animal = value.trim().toLowerCase();
+            applyAvatarDom(avatarEl, { mode: 'pixel', animal });
+            writeAvatarPref(agentId, { mode: 'pixel', animal });
+            // Only save to server when IMPORT_MUTATION_ENABLED is true
+            if (IMPORT_MUTATION_ENABLED) {
+              await saveAvatarToServer(agentId, { mode: 'pixel', animal });
+            }
+            syncPreview();
+          } catch (e) {
+            const message = String(e && e.message);
+            alert(message || L.failed);
+          } finally {
+            setBusy(false);
+          }
+        });
+      });
+    };
+
+    const openCropper = async (file) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.decoding = 'async';
+      img.src = url;
+      await new Promise((resolve) => { img.onload = resolve; img.onerror = resolve; });
+      URL.revokeObjectURL(url);
+      if (!img.naturalWidth || !img.naturalHeight) throw new Error('invalid image');
+
+      const cropBackdrop = document.createElement('div');
+      cropBackdrop.className = 'avatar-modal-backdrop';
+      cropBackdrop.innerHTML = \`
+        <div class="avatar-modal" role="dialog" aria-modal="true" aria-label="Crop">
+          <div class="avatar-modal-head">
+            <div class="avatar-modal-title">\${esc(L.upload)}</div>
+            <button type="button" class="avatar-modal-close" aria-label="Close" title="Close">X</button>
+          </div>
+          <div class="avatar-modal-body" style="grid-template-columns:1fr;">
+            <div class="avatar-crop-shell">
+              <canvas class="avatar-crop-canvas" width="420" height="420"></canvas>
+              <div class="avatar-crop-controls">
+                <label class="meta">Zoom <input type="range" min="1" max="3.2" step="0.01" value="1.6" /></label>
+                <button type="button" class="btn avatar-upload-btn" data-action="save">\${esc(L.apply)}</button>
+              </div>
+              <div class="meta">\${esc(L.chooseFile)}</div>
+            </div>
+          </div>
+        </div>\`;
+      document.body.appendChild(cropBackdrop);
+      const closeCrop = () => { try { cropBackdrop.remove(); } catch {} };
+      q('.avatar-modal-close', cropBackdrop)?.addEventListener('click', closeCrop);
+      cropBackdrop.addEventListener('click', (e) => { if (e.target === cropBackdrop) closeCrop(); });
+
+      const canvas = q('canvas.avatar-crop-canvas', cropBackdrop);
+      const zoomInput = q('input[type="range"]', cropBackdrop);
+      if (!canvas || !zoomInput) throw new Error('cropper missing');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('no canvas');
+
+      const state = { zoom: Number(zoomInput.value) || 1.6, dx: 0, dy: 0, dragging: false, lastX: 0, lastY: 0 };
+      const draw = () => {
+        const cw = canvas.width;
+        const ch = canvas.height;
+        ctx.clearRect(0, 0, cw, ch);
+        const scale = state.zoom;
+        const iw = img.naturalWidth * scale;
+        const ih = img.naturalHeight * scale;
+        const x = (cw - iw) / 2 + state.dx;
+        const y = (ch - ih) / 2 + state.dy;
+        ctx.fillStyle = 'rgba(0,0,0,0.14)';
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.drawImage(img, x, y, iw, ih);
+        ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(10, 10, cw - 20, ch - 20);
+      };
+      draw();
+      zoomInput.addEventListener('input', () => { state.zoom = Number(zoomInput.value) || 1.6; draw(); });
+      canvas.addEventListener('mousedown', (e) => { state.dragging = true; state.lastX = e.clientX; state.lastY = e.clientY; });
+      window.addEventListener('mouseup', () => { state.dragging = false; });
+      window.addEventListener('mousemove', (e) => {
+        if (!state.dragging) return;
+        const dx = e.clientX - state.lastX;
+        const dy = e.clientY - state.lastY;
+        state.lastX = e.clientX;
+        state.lastY = e.clientY;
+        state.dx += dx;
+        state.dy += dy;
+        draw();
+      });
+
+      const producePng = () => {
+        const out = document.createElement('canvas');
+        out.width = 256;
+        out.height = 256;
+        const octx = out.getContext('2d');
+        if (!octx) return null;
+        // Map inner crop rect (10..cw-10) to output.
+        const cw = canvas.width;
+        const ch = canvas.height;
+        const cropX = 10;
+        const cropY = 10;
+        const cropW = cw - 20;
+        const cropH = ch - 20;
+        const scale = state.zoom;
+        const iw = img.naturalWidth * scale;
+        const ih = img.naturalHeight * scale;
+        const x = (cw - iw) / 2 + state.dx;
+        const y = (ch - ih) / 2 + state.dy;
+        // Draw same image into out by sampling from the virtual canvas.
+        octx.fillStyle = '#ffffff';
+        octx.fillRect(0, 0, out.width, out.height);
+        // Compute source rect in image space.
+        const sx = (cropX - x) / scale;
+        const sy = (cropY - y) / scale;
+        const sw = cropW / scale;
+        const sh = cropH / scale;
+        octx.drawImage(img, sx, sy, sw, sh, 0, 0, out.width, out.height);
+        return out.toDataURL('image/png');
+      };
+
+      return await new Promise((resolve, reject) => {
+        q('[data-action="save"]', cropBackdrop)?.addEventListener('click', async () => {
+          try {
+            const dataUrl = producePng();
+            if (!dataUrl) throw new Error('encode failed');
+            closeCrop();
+            resolve({ dataUrl });
+          } catch (e) {
+            reject(e);
+          }
+        });
+      });
+    };
+
+    const renderCustomTab = () => {
+      if (!panelBody) return;
+      panelBody.innerHTML = \`
+        <div class="avatar-upload-row">
+          <button type="button" class="btn avatar-upload-btn" data-action="upload">\${esc(L.upload)}</button>
+          <div class="meta" data-upload-status>\${esc(L.loading)}</div>
+        </div>
+        <div class="avatar-upload-list" data-upload-list></div>\`;
+
+      const status = q('[data-upload-status]', panelBody);
+      const list = q('[data-upload-list]', panelBody);
+      const refresh = async () => {
+        if (!status || !list) return;
+        status.textContent = L.emptyUploads;
+        list.innerHTML = '';
+      };
+      refresh();
+
+      panelBody.addEventListener('click', async (e) => {
+        const target = e.target;
+        if (!(target instanceof HTMLElement)) return;
+        const action = target.getAttribute('data-action') || '';
+        if (!action) return;
+        if (action === 'upload') {
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.accept = 'image/*';
+          input.onchange = async () => {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            setBusy(true);
+            try {
+              const crop = await openCropper(file);
+              const dataUrl = crop.dataUrl;
+              if (dataUrl) {
+                if (IMPORT_MUTATION_ENABLED) {
+                  // Upload to server when IMPORT_MUTATION_ENABLED is true
+                  const upload = await uploadAvatarToServer(dataUrl, file.name);
+                  if (upload && upload.fileName) {
+                    writeAvatarPref(agentId, { mode: 'custom', image: upload.fileName });
+                    applyAvatarDom(avatarEl, { mode: 'custom', image: upload.fileName });
+                    await saveAvatarToServer(agentId, { mode: 'custom', image: upload.fileName });
+                  } else {
+                    // Fallback to localStorage if upload fails
+                    writeAvatarPref(agentId, { mode: 'custom', imageDataUrl: dataUrl });
+                    applyAvatarDom(avatarEl, { mode: 'custom', imageDataUrl: dataUrl });
+                  }
+                } else {
+                  // local-only: keep data url in localStorage
+                  writeAvatarPref(agentId, { mode: 'custom', imageDataUrl: dataUrl });
+                  applyAvatarDom(avatarEl, { mode: 'custom', imageDataUrl: dataUrl });
+                }
+                syncPreview();
+              }
+            } catch (err) {
+              const message = String(err && err.message);
+              alert(message || L.failed);
+            } finally {
+              setBusy(false);
+            }
+          };
+          input.click();
+        }
+      });
+    };
+
+    const setTab = (tab) => {
+      qa('.avatar-tab', backdrop).forEach((node) => node.classList.toggle('active', node.getAttribute('data-tab') === tab));
+      if (tab === 'custom') {
+        renderCustomTab();
+      } else {
+        renderPixelTab();
+      }
+    };
+    qa('.avatar-tab', backdrop).forEach((btn) => btn.addEventListener('click', () => setTab(btn.getAttribute('data-tab') || 'pixel')));
+
+    // Seed preview from current avatar element.
+    const mode = (avatarEl.dataset.avatarMode || 'pixel').trim();
+    const image = (avatarEl.dataset.avatarImage || '').trim();
+    if (previewStage) {
+      if (mode === 'custom' && image) {
+        previewStage.innerHTML = '<img class="agent-avatar-img" src="/avatars/' + esc(image) + '" alt="" loading="lazy" />';
+      } else {
+        previewStage.innerHTML = '<canvas class="agent-pixel-canvas" width="200" height="200"></canvas>';
+        const faux = document.createElement('div');
+        faux.dataset.animal = (avatarEl.dataset.animal || 'default');
+        faux.style.setProperty('--agent-accent', getComputedStyle(avatarEl).getPropertyValue('--agent-accent'));
+        faux.appendChild(previewStage.firstElementChild);
+        renderStaticPixel(faux);
+      }
+    }
+    setTab('pixel');
+    syncPreview();
+
+
+
+  };
+
+  // Hook all avatar edit buttons (staff + agent cards).
+  document.addEventListener('click', (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const btn = target.closest && target.closest('.avatar-edit-btn');
+    if (!btn) return;
+    const avatarEl = btn.closest('.staff-avatar, .agent-avatar');
+    if (!(avatarEl instanceof HTMLElement)) return;
+    e.preventDefault();
+    openModal(avatarEl);
+  });
+
+  // Apply avatar preferences on load.
+  // When IMPORT_MUTATION_ENABLED is true, prefer server config and sync to localStorage.
+  // When false, use localStorage only.
+  qa('.staff-avatar[data-agent-id], .agent-avatar[data-agent-id]').forEach(async (avatarEl) => {
+    const agentId = (avatarEl.dataset.agentId || '').trim();
+    if (!agentId) return;
+    
+    let pref = null;
+    if (IMPORT_MUTATION_ENABLED) {
+      // Try to load from server first (GET does not require token)
+      pref = await loadAvatarFromServer(agentId);
+      if (pref) {
+        // Sync server config to localStorage
+        writeAvatarPref(agentId, pref);
+      }
+    }
+    // Fallback to localStorage if server config not available
+    if (!pref) {
+      pref = readAvatarPref(agentId);
+    }
+    
+    if (!pref) return;
+    if (pref.mode === 'custom' && (pref.image || pref.imageDataUrl)) {
+      applyAvatarDom(avatarEl, { mode: 'custom', image: String(pref.image || ''), imageDataUrl: pref.imageDataUrl ? String(pref.imageDataUrl) : '' });
+      return;
+    }
+    if (pref.mode === 'pixel' && pref.animal) {
+      applyAvatarDom(avatarEl, { mode: 'pixel', animal: String(pref.animal) });
+    }
   });
 })();
 </script>`;
@@ -12137,6 +15699,36 @@ function renderAgentVisualEnhancerScript(): string {
     return hash / 0xffffffff;
   };
 
+  try {
+    const animals = Object.keys(spriteFactory).filter((key) => key !== 'default');
+    window.__openclawPixelAvatar = {
+      animals,
+      renderCanvas: (canvas, animal, accent) => {
+        render(canvas, (animal || 'default').trim().toLowerCase(), accent || '#4e79a7', { bob: 0, sway: 0, blink: 0 });
+      },
+      renderElement: (avatarEl) => {
+        if (!avatarEl) return;
+        const canvas = avatarEl.querySelector && avatarEl.querySelector('.agent-pixel-canvas');
+        if (!canvas) return;
+        const accent = getComputedStyle(avatarEl).getPropertyValue('--agent-accent').trim() || '#4e79a7';
+        const animal = (avatarEl.dataset && avatarEl.dataset.animal ? avatarEl.dataset.animal : 'default');
+        render(canvas, (animal || 'default').trim().toLowerCase(), accent, { bob: 0, sway: 0, blink: 0 });
+      },
+      updateAvatar: (avatarEl, next) => {
+        if (!avatarEl) return;
+        const canvas = avatarEl.querySelector && avatarEl.querySelector('.agent-pixel-canvas');
+        if (!canvas) return;
+        const actor = motionActors.find((item) => item.canvas === canvas);
+        if (!actor) return;
+        actor.animal = (next && next.animal ? next.animal : actor.animal);
+        actor.disabled = Boolean(next && next.mode === 'custom');
+        if (!actor.disabled) {
+          render(actor.canvas, actor.animal, actor.accent, { bob: 0, sway: 0, blink: 0 });
+        }
+      },
+    };
+  } catch {}
+
   const motionActors = [];
   const motionProfiles = {
     robot: { bobAmp: 1.2, swayAmp: 0.9, bobFreq: 1.0, swayFreq: 0.82, blinkThreshold: 0.988 },
@@ -12159,6 +15751,7 @@ function renderAgentVisualEnhancerScript(): string {
       accent,
       animal,
       seed: hashSeed(animal + ':' + accent + ':' + String(index + 1)),
+      disabled: false,
     });
   });
 
@@ -12173,6 +15766,8 @@ function renderAgentVisualEnhancerScript(): string {
 
   const step = (now) => {
     motionActors.forEach((actor) => {
+      if (!document.body.contains(actor.canvas)) return;
+      if (actor.disabled) return;
       const profile = motionProfiles[actor.animal] || motionProfiles.default;
       const phase = now * 0.0032 * profile.bobFreq + actor.seed * 9.7;
       const bob = Math.round(Math.sin(phase) * profile.bobAmp);
@@ -12343,8 +15938,8 @@ function renderQuotaWindowRow(
   const resetAt = input.resetAt?.trim();
   const resetText =
     !resetAt
-      ? pickUiText(language, "Not provided", "未提供")
-      : `<span data-quota-reset-at="${escapeHtml(resetAt)}" data-quota-window="${escapeHtml(input.label)}">${escapeHtml(pickUiText(language, "Loading...", "加载中..."))}</span>`;
+      ? pickUiText(language, "Reset not provided", "重置时间未提供")
+      : `${escapeHtml(pickUiText(language, "Reset", "重置"))} <span data-quota-reset-at="${escapeHtml(resetAt)}" data-quota-window="${escapeHtml(input.label)}">${escapeHtml(pickUiText(language, "Loading...", "加载中..."))}</span>`;
   return `<div class="quota-row">
     <div class="quota-head">
       <span class="quota-label">${escapeHtml(input.label)}</span>
@@ -12453,8 +16048,14 @@ function renderSubscriptionStatusCard(
       subscription.secondaryRemainingPercent ??
         (typeof secondaryUsed === "number" ? 100 - secondaryUsed : undefined),
     );
+    const primarySummary = `${pickUiText(language, "Primary window", "主窗口")} ${normalizeQuotaWindowLabel(subscription.primaryWindowLabel, "5h")} · ${pickUiText(language, "Used", "已用")} ${typeof primaryUsed === "number" ? `${primaryUsed.toFixed(1)}%` : "—"} · ${pickUiText(language, "Remaining", "剩余")} ${typeof primaryRemaining === "number" ? `${primaryRemaining.toFixed(1)}%` : "—"}`;
+    const primaryReset =
+      subscription.primaryResetAt?.trim()
+        ? `<span>${escapeHtml(pickUiText(language, "Reset", "重置"))} <span data-quota-reset-at="${escapeHtml(subscription.primaryResetAt)}" data-quota-window="${escapeHtml(normalizeQuotaWindowLabel(subscription.primaryWindowLabel, "5h"))}">${escapeHtml(pickUiText(language, "Loading...", "加载中..."))}</span></span>`
+        : "";
     return `<div class="subscription-pill">
       <div><strong>${escapeHtml(pickUiText(language, "Quota windows", "额度窗口"))}</strong> ${badge(subscription.status, statusLabel)}</div>
+      <div class="meta">${escapeHtml(primarySummary)}${primaryReset ? ` · ${primaryReset}` : ""}</div>
       <div class="meta">${escapeHtml(pickUiText(language, "Only the key windows are shown: 5h and Week.", "仅显示关键额度：5h 与 Week。"))}</div>
       <div class="quota-compact">
         ${renderQuotaWindowRow({
@@ -12494,6 +16095,10 @@ function renderSubscriptionStatusCard(
 
 export function renderSubscriptionStatusCardForSmoke(subscription: UsageCostSnapshot["subscription"]): string {
   return renderSubscriptionStatusCard(subscription, "en");
+}
+
+export function pickLatestSessionActivityTimestampForSmoke(...values: Array<string | undefined>): string | undefined {
+  return pickLatestSessionActivityTimestamp(...values);
 }
 
 export function renderDashboardSectionNavForSmoke(
@@ -13593,6 +17198,88 @@ async function readRawBody(req: IncomingMessage, maxBytes: number): Promise<stri
 
   if (chunks.length === 0) return "";
   return Buffer.concat(chunks).toString("utf8").trim();
+}
+
+function normalizeSafeFileName(input: string): string | undefined {
+  const trimmed = String(input || "").trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > 160) return undefined;
+  if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("..")) return undefined;
+  if (/[\u0000-\u001F\u007F]/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+function avatarContentType(fileName: string): string {
+  const ext = extname(fileName).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  return "application/octet-stream";
+}
+
+async function serveAvatarFile(res: ServerResponse, rawFileName: string): Promise<void> {
+  const fileName = normalizeSafeFileName(rawFileName);
+  if (!fileName) return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
+  const filePath = join(AVATAR_UPLOADS_DIR, fileName);
+  try {
+    const buffer = await readFile(filePath);
+    res.writeHead(200, {
+      "content-type": avatarContentType(fileName),
+      "cache-control": "private, max-age=3600",
+    });
+    res.end(buffer);
+  } catch {
+    return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
+  }
+}
+
+async function writeAvatarUploadFromDataUrl(input: { dataUrl: string; fileNameHint?: string }): Promise<{ fileName: string; sizeBytes: number }> {
+  await mkdir(AVATAR_UPLOADS_DIR, { recursive: true });
+  const raw = String(input.dataUrl || "").trim();
+  const match = /^data:(image\/png|image\/jpeg|image\/webp);base64,([A-Za-z0-9+/=]+)$/.exec(raw);
+  if (!match) {
+    throw new RequestValidationError("dataUrl must be a base64 data URL for png/jpeg/webp.", 400);
+  }
+  const mime = match[1];
+  const base64 = match[2];
+  const buffer = Buffer.from(base64, "base64");
+  if (buffer.length === 0) throw new RequestValidationError("dataUrl is empty.", 400);
+  if (buffer.length > AVATAR_UPLOAD_MAX_BYTES) throw new RequestValidationError("Avatar upload too large.", 413);
+  const ext = mime === "image/png" ? ".png" : mime === "image/webp" ? ".webp" : ".jpg";
+  const hint = normalizeSafeFileName(input.fileNameHint || "");
+  const hintedBase = hint ? basename(hint, extname(hint)) : "";
+  const base = hintedBase && /^[a-zA-Z0-9._-]+$/.test(hintedBase) ? hintedBase.slice(0, 48) : "avatar";
+  const fileName = `${base}-${randomUUID()}${ext}`;
+  const filePath = join(AVATAR_UPLOADS_DIR, fileName);
+  await writeFile(filePath, buffer);
+  return { fileName, sizeBytes: buffer.length };
+}
+
+async function deleteAvatarUpload(rawFileName: string): Promise<boolean> {
+  const fileName = normalizeSafeFileName(rawFileName);
+  if (!fileName) return false;
+  const filePath = join(AVATAR_UPLOADS_DIR, fileName);
+  try {
+    await unlink(filePath);
+  } catch {
+    return false;
+  }
+
+  // Best-effort cleanup of preferences that reference this file.
+  try {
+    const prefs = await loadAvatarPreferences();
+    let mutated = false;
+    const next = { ...prefs.preferences, agents: { ...prefs.preferences.agents } };
+    for (const [agentId, pref] of Object.entries(next.agents)) {
+      if (pref?.mode === "custom" && pref.image === fileName) {
+        delete next.agents[agentId];
+        mutated = true;
+      }
+    }
+    if (mutated) await saveAvatarPreferences({ ...next, updatedAt: new Date().toISOString(), version: 1 });
+  } catch {}
+
+  return true;
 }
 
 function writeJson(res: ServerResponse, statusCode: number, body: unknown): void {
